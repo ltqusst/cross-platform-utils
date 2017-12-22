@@ -73,6 +73,7 @@ public:
 private:
 	static const int        m_epollTimeout = 100;
 	std::atomic<bool>		m_exit;
+	std::mutex				m_mutex;
 
 	//a general mapping facility
 	static const int							m_map_fast_size = 1024;
@@ -81,6 +82,7 @@ private:
 
 	ipc_connection* & get(OS_HANDLE oshd)
 	{
+		std::unique_lock<std::mutex> lk(m_mutex);
 		unsigned long v = (unsigned long)oshd;
 		if (v >= 0 && v < m_map_fast_size)
 			return m_map_fast[v];
@@ -92,6 +94,7 @@ private:
 	}
 	void erase(OS_HANDLE oshd)
 	{
+		std::unique_lock<std::mutex> lk(m_mutex);
 		unsigned long v = (unsigned long)oshd;
 		if (v >= 0 && v < m_map_fast_size) {
 			m_map_fast[v] = NULL;
@@ -203,7 +206,7 @@ void ipc_io_service_impl::unassociate(ipc_connection * pconn)
 #ifdef WIN32
 	//no way to un-associate unless we close the file handle
 #else
-	epoll_ctl(m_epollFd, EPOLL_CTL_DEL ? ? ? , pconn->native_handle(), &event);
+	epoll_ctl(m_epollFd, EPOLL_CTL_DEL, pconn->native_handle(), NULL);
 #endif
 
 	//remove from cache
@@ -285,6 +288,14 @@ void ipc_io_service_impl::run()
 			}
 		}
 #else
+        /* Block SIGPIPE signal because remote peer may exit abnormally*/
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGPIPE);
+        int s = pthread_sigmask(SIG_BLOCK, &set, NULL);
+        if (s != 0)
+        	THROW_SYSTEM_ERROR("pthread_sigmask failed", s);
+
 		m_exit.store(false);
 		//this thread will exit when m_exit is set
 		// or the CompletionPort is closed
@@ -303,10 +314,10 @@ void ipc_io_service_impl::run()
 					pconn->notify(0, 0, events[i].events);
 				}
 				catch (std::exception & e) {
-					std::cerr << std::endl << "Exception in " __FUNCTION__ ": " << e.what() << std::endl;
+					std::cerr << std::endl << "Exception in " << __FUNCTION__ << ": " << e.what() << std::endl;
 				}
 				catch (...) {
-					std::cerr << std::endl << "Exception in " __FUNCTION__ ": " << "Unknown" << std::endl;
+					std::cerr << std::endl << "Exception in " << __FUNCTION__ << ": " << "Unknown" << std::endl;
 				}
 			}
 		}
@@ -327,7 +338,7 @@ class ipc_connection_win_namedpipe : public ipc_connection
 public:
 	ipc_connection_win_namedpipe(ipc_io_service & service, const std::string & servername);
 	~ipc_connection_win_namedpipe();
-	virtual void notify(int error_code, int transferred_cnt, void* hint);
+	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint);
 
 	virtual OS_HANDLE native_handle() { return m_oshd; }
 
@@ -403,7 +414,7 @@ ipc_connection_win_namedpipe::~ipc_connection_win_namedpipe()
 	close();
 }
 
-void ipc_connection_win_namedpipe::notify(int error_code, int transferred_cnt, void * hint)
+void ipc_connection_win_namedpipe::notify(int error_code, int transferred_cnt, uintptr_t hint)
 {
 	OVERLAPPED * poverlapped = (OVERLAPPED *)hint;
 
@@ -749,13 +760,16 @@ public:
 	ipc_connection_linux_UDS(ipc_io_service & service, const std::string & serverName);
 	~ipc_connection_linux_UDS();
 
-	virtual void notify(int error_code, int transferred_cnt, unsigned long hint);
+	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint);
 
 	virtual OS_HANDLE native_handle() { return m_fd; }
 
 	//blocking/sync version(based on async version)
-	virtual int read(void * pbuff, const int len, int *lp_cnt);
-	virtual int write(void * pbuff, const int len);
+	virtual void read(void * pbuff, const int len, int *lp_cnt);
+	virtual void write(void * pbuff, const int len);
+
+	virtual void read(OS_HANDLE &oshd);
+	virtual void write(OS_HANDLE oshd);
 
 	//client(blocking is acceptable because usually its short latency)
 	virtual int connect(const std::string & serverName);
@@ -776,7 +790,7 @@ private:
 };
 
 ipc_connection_linux_UDS::ipc_connection_linux_UDS(ipc_io_service &service, const std::string & serverName) :
-	ipc_connection(service), m_listening(false)
+	ipc_connection(service), m_fd(-1), m_name(""),m_listening(false)
 {
 	struct sockaddr_un addr;
 
@@ -808,7 +822,7 @@ ipc_connection_linux_UDS::ipc_connection_linux_UDS(ipc_io_service &service, cons
 
 	::unlink(sun_path.c_str());
 
-	int cnt = string_copy(addr.sun_path, sizeof(addr.sun_path), sun_path);
+	int cnt = string_copy(addr.sun_path, sun_path);
 	int len = offsetof(sockaddr_un, sun_path) + cnt + 1;
 
 	if (::bind(m_fd, (struct sockaddr*)&addr, len) < 0) 
@@ -817,7 +831,7 @@ ipc_connection_linux_UDS::ipc_connection_linux_UDS(ipc_io_service &service, cons
 	service.associate(this);
 }
 ipc_connection_linux_UDS::ipc_connection_linux_UDS(ipc_io_service & service, int fd) :
-	ipc_connection(service), m_listening(false), m_fd(fd)
+	ipc_connection(service), m_fd(fd), m_name(""), m_listening(false)
 {
 	service.associate(this);
 }
@@ -827,7 +841,7 @@ ipc_connection_linux_UDS::~ipc_connection_linux_UDS()
 	close();
 }
 
-void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, unsigned long hint)
+void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, uintptr_t hint)
 {
 	//printf(">>>>>>>>>>>>>>> notify : %s,%s\n",hint&EPOLLIN?"EPOLLIN":"",hint&EPOLLRDHUP?"EPOLLRDHUP":"");
 
@@ -839,7 +853,7 @@ void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, unsig
 	//if we are communication socket, 	do on_read on EPOLLIN
 	//
 	if (m_listening && (hint & EPOLLIN)) {
-		int clifd, err, rval;
+		int clifd;
 		struct stat statbuf;
 		struct sockaddr_un addr;
 
@@ -878,7 +892,7 @@ void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, unsig
 		}
 
 	}
-	else if (hint & EPOLLRDHUP) {
+	else if ((hint & EPOLLRDHUP) || (hint & EPOLLHUP)) {
 		if (on_close)
 			on_close(this);
 	}
@@ -892,13 +906,13 @@ void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, unsig
 
 int ipc_connection_linux_UDS::connect(const std::string & serverName)
 {
-	int len, err, rval;
+	int len;
 	struct sockaddr_un addr = { 0 };
 
 	/* fill socket address structure with server's address */
 	addr.sun_family = AF_UNIX;
 
-	int cnt = string_copy(addr.sun_path, sizeof(addr.sun_path), serverName);
+	int cnt = string_copy(addr.sun_path, serverName);
 
 	len = offsetof(struct sockaddr_un, sun_path) + cnt + 1;
 
@@ -914,6 +928,7 @@ int ipc_connection_linux_UDS::listen(void)
 {
 	if (!m_listening) {
 		if (::listen(m_fd, m_numListen) < 0) {
+			THROW_SYSTEM_ERROR("listen() listen failed.", errno);
 			return errno;
 		}
 		m_listening = true;
@@ -921,12 +936,11 @@ int ipc_connection_linux_UDS::listen(void)
 	return 0;
 }
 
-int ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int * lp_cnt)
+void ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int * lp_cnt)
 {
-	int err = 0;
-
 	if (m_fd <= 0 || !buffer || bufferSize <= 0) {
-		return -1;
+		assert_line(0);
+		THROW_(std::invalid_argument, "ipc_connection_linux_UDS::read");
 	}
 
 	char *ptr = static_cast<char*>(buffer);
@@ -942,8 +956,12 @@ int ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int * lp
 		}
 		else if (readBytes < 0) {
 			if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-				err = errno;
-				fprintf(stderr, "read failed with %d: %s\n", errno, strerror(errno));
+				THROW_SYSTEM_ERROR("read failed ", errno);
+				//if exception is banned, we just stop further processing
+				break;
+			}
+			if((errno == EAGAIN || errno == EWOULDBLOCK) && lp_cnt){
+				//we can return nothing when no-blocking is required
 				break;
 			}
 			readBytes = 0;
@@ -960,15 +978,16 @@ int ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int * lp
 		*lp_cnt = (bufferSize - leftBytes);
 
 	//fprintf(stderr,"read %d bytes, with errno = %d: %s\n", bufferSize - leftBytes, err, strerror(err));
-	return err;
+	return;
 }
 
-int ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
+void ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
 {
-	int err = 0;
 
 	if (m_fd <= 0 || !buffer || bufferSize <= 0) {
-		return -1;
+		//return -1;
+		assert_line(0);
+		THROW_(std::invalid_argument, "ipc_connection_linux_UDS::write");
 	}
 
 	char *ptr = static_cast<char*>(buffer);
@@ -978,8 +997,9 @@ int ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
 		int writeBytes = ::write(m_fd, ptr, leftBytes);
 		if (writeBytes < 0) {
 			if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-				err = errno;
-				fprintf(stderr, "write failed with %d: %s\n", errno, strerror(errno));
+				//err = errno;
+				//fprintf(stderr, "write failed with %d: %s\n", errno, strerror(errno));
+				THROW_SYSTEM_ERROR("write failed ", errno);
 				break;
 			}
 			writeBytes = 0;
@@ -989,7 +1009,15 @@ int ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
 		leftBytes -= writeBytes;
 	}
 
-	return err;
+	return;
+}
+void ipc_connection_linux_UDS::read(OS_HANDLE &oshd)
+{
+	assert(0);
+}
+void ipc_connection_linux_UDS::write(OS_HANDLE oshd)
+{
+	assert(0);
 }
 
 bool ipc_connection_linux_UDS::set_block_mode(bool makeBlocking)

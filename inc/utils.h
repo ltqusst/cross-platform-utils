@@ -25,8 +25,8 @@ protected:
 	NonCopyable() {}
 	~NonCopyable() {} /// Protected non-virtual destructor
 private:
-	NonCopyable(const NonCopyable &) {};
-	NonCopyable & operator= (const NonCopyable &) {};
+	NonCopyable(const NonCopyable &) {}
+	NonCopyable & operator= (const NonCopyable &) {return *this;}
 };
 
 //====================================================================
@@ -36,11 +36,15 @@ private:
 #define S_(x) S(x)					//S(42)
 #define __STR_LINE__ S_(__LINE__)	//S_(__LINE__)
 
+#define DBG_LINENO " at " __FILE__ ":"  __STR_LINE__
 //====================================================================
 //exception
 #include <stdexcept>
 #define THROW_SYSTEM_ERROR(msg, code) \
 	throw std::system_error((code),std::system_category(), std::string(msg) + " (at) " __FILE__ ":"  __STR_LINE__);\
+
+#define THROW_(exception_type, msg) \
+	throw exception_type(std::string(msg) + " (at) " __FILE__ ":"  __STR_LINE__);\
 
 //====================================================================
 //assert
@@ -79,119 +83,159 @@ ScopeGuard<Fun> scopeGuard(Fun f) {
 //====================================================================
 // Andrei Alexandrescu's talk (Systematic Error Handling in C++) 
 //Expected<T> idiom
+// since we do not use exceptions we did some modifications
+//
+// EResult is a common value type that similar to a int
+// except that when error occurs, lot of
 #include <exception>
-template<class T>
-class Expected
+
+#if 1
+#define EResult_DEBUG(msg)
+#else
+#define EResult_DEBUG(msg) \
+	std::cout << msg << " " << "[" << this << "] m_pdetail=" << m_pdetail \
+	<< " cnt=" << (m_pdetail?m_pdetail->m_count:0)	<< std::endl;
+#endif
+
+class EResult
 {
-	union {
-		T ham;
-		std::exception_ptr spam;
+	//reference counting based detail information
+	struct Detail
+	{
+		bool 				m_checked  	= false;
+		int 				m_err	 	= 0;
+		int 				m_err_sys 	= 0;
+		std::stringstream   m_ss{};
+		size_t   			m_count 	= 0;
 	};
-	bool gotHam;
-	Expected() {} //used internally (construct using static factory method)
+
+	//no detail by default to maximize normal execution flow
+	Detail					* m_pdetail = NULL;
+
+	void deref()
+	{
+		if(m_pdetail){
+			m_pdetail->m_count--;
+
+			EResult_DEBUG("**** deref");
+
+			if(m_pdetail->m_count == 0){
+				//only raise unchecked error on last referencing
+				if(m_pdetail->m_err && !m_pdetail->m_checked){
+					std::cerr << "unchecked error code: "
+							<< std::endl << "\t"
+							<< message()
+							<< std::endl;
+					delete m_pdetail;
+					std::terminate();
+				}
+				else{
+					EResult_DEBUG("**** DELETE m_pdetail")
+					delete m_pdetail;
+				}
+
+				m_pdetail = NULL;
+			}
+		}
+	}
 
 public:
-	//implicit constructor from value of T
-	Expected(const T& rhs) : ham(rhs), gotHam(true) {}
-	Expected(T&& rhs): ham(std::move(rhs)), gotHam(true) {}
 
-	//copy
-	Expected(const Expected & rhs) : gotHam(rhs.gotHam) {
-		if (gotHam) new (&ham) T(rhs.ham);
-		else new (&spam) std::exception_ptr(rhs.spam);
+	//ctor
+	EResult(int err = 0, int err_sys = 0){
+		EResult_DEBUG("**** ctor");
+
+		//m_pdetail == NULL means no error
+		//and little expensive when error occurs
+		if(err || err_sys){
+			m_pdetail = new Detail;
+			m_pdetail->m_err = err;
+			m_pdetail->m_err_sys = err_sys;
+			m_pdetail->m_count = 1;
+		}
 	}
 
-	Expected(Expected && rhs) : gotHam(rhs.gotHam) {
-		if (gotHam) new (&ham) T(std::move(rhs.ham));
-		else new (&spam) std::exception_ptr(std::move(rhs.spam));
+	//copy ctor
+	EResult(const EResult & rhs):
+		m_pdetail(rhs.m_pdetail){
+		EResult_DEBUG("**** copy ctor");
+		if(m_pdetail)
+			m_pdetail->m_count++;
 	}
 
-	~Expected() {
-		using std::exception_ptr;
-		if (gotHam) ham.~T();
-		else spam.~exception_ptr();
+	//copy assign
+	EResult& operator=(const EResult & rhs){
+		EResult_DEBUG("**** copy assign");
+		deref();
+		m_pdetail = rhs.m_pdetail;
+		if(m_pdetail)
+			m_pdetail->m_count++;
 	}
 
-	void swap(Expected& rhs) {
-		if (gotHam) {
-			if (rhs.gotHam) {
-				using std::swap;
-				swap(ham, rhs.ham);
-			} else {
-				auto t = std::move(rhs.spam);
-				new(&rhs.ham) T(std::move(ham));
-				new(&spam) std::exception_ptr(t);
-				std::swap(gotHam, rhs.gotHam);
+	//move ctor: just empty rhs
+	EResult(EResult && rhs) :
+		m_pdetail(rhs.m_pdetail){
+		EResult_DEBUG("**** move ctor ");
+		rhs.m_pdetail = NULL;
+	}
+
+	//move assign: just empty rhs
+	EResult& operator=(EResult && rhs){
+		EResult_DEBUG("**** move assign");
+		deref();
+		m_pdetail = rhs.m_pdetail;
+		rhs.m_pdetail = NULL;
+	}
+
+	~EResult() {
+		deref();
+	}
+
+	std::string message(void)
+	{
+		if(m_pdetail && m_pdetail->m_err){
+			std::stringstream ss;
+			ss << "error (" << m_pdetail->m_err << "): " << m_pdetail->m_ss.str();
+			//err_sys is only meaningful when err occurs
+			if(m_pdetail->m_err_sys){
+				std::error_code ec(m_pdetail->m_err_sys, std::system_category());
+				ss << ec.message() << " (" << m_pdetail->m_err_sys << ")";
 			}
-		} else {
-			if (rhs.gotHam) {
-				rhs.swap(*this);
-			}else {
-				spam.swap(rhs.spam);
-				std::swap(gotHam, rhs.gotHam);
-			}
+			return ss.str();
 		}
+
+		return "no error";
 	}
 
-	//builder
-	template<class E>
-	static Expected<T> fromException(const E& exception) {
-		if (typeid(exception) != typeid(E)) {
-			throw std::invalid_argument("slicing detected");
+	int error(){
+		if(m_pdetail){
+			m_pdetail->m_checked = true;
+			return m_pdetail->m_err;
 		}
-		return fromException(std::make_exception_ptr(exception));
+		return 0;	//no error
 	}
 
-	static Expected<T> fromException(std::exception_ptr p) {
-		Expected<T> result;
-		result.gotHam = false;
-		new(&result.spam) std::exception_ptr(std::move(p));
-		return result;
-	}
-
-	static Expected<T> fromException() {
-		return fromException(std::current_exception());
-	}
-
-	bool valid() const {
-		return gotHam;
-	}
-
-	T& get() {
-		if (!gotHam) std::rethrow_exception(spam);
-		return ham;
-	}
-
-	const T& get() const {
-		if (!gotHam) std::rethrow_exception(spam);
-		return ham;
-	}
-
-
-	template<class E>
-	bool hasException() const {
-		try {
-			if (!gotHam) std::rethrow_exception(spam);
-		}catch (const E& object) {
-			return true;
+	int error_sys(){
+		if(m_pdetail){
+			m_pdetail->m_checked = true;
+			return m_pdetail->m_err_sys;
 		}
-		catch (...) {
-		}
-		return false;
+		return 0;	//no error
 	}
 
-	//to support:
-	//   auto r = Expected<string>::fromCode([]{ ... });
-	template<class F>
-	static Expected fromCode(F fun) {
-		try {
-			return Expected(fun());
-		}
-		catch (...) {
-			return fromException();
-		}
+	//type-safe syntax for appending any additional error message
+	template<class T>
+	EResult& operator<<(const T& t)
+	{
+		//only log error message on error construct
+		if(m_pdetail)
+			m_pdetail->m_ss << t;
+		return *this;
 	}
 
 };
+
+#define anERROR(...) EResult(__VA_ARGS__) <<__FILE__<<":"<<__LINE__ << "\t"
+
 
 #endif

@@ -67,7 +67,7 @@ public:
 
 	//on Windows, notify means one IO request is completed or error occured
 	//on Linux, notify means one IO request type is ready to issue without blocking
-	virtual void notify(int error_code, int transferred_cnt, void * hint) = 0;
+	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint) = 0;
 
 	//blocking/sync version
 	//  based on async version, so they cannot be called within async handler!

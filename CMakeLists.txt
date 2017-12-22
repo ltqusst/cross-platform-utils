@@ -1,10 +1,16 @@
 cmake_minimum_required(VERSION 2.8)
 project(cross-platform-utils)
 
+set (CMAKE_CXX_STANDARD 11)
+
 #platform dependent FLAGS
 if (UNIX)
   message(status "Setting GCC flags")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}  -Wall -c -fmessage-length=0 -fPIE -fstack-protector-all -Wstack-protector -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security -fPIC")
+  #need pthread because C++11 on Linux depends on it
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+  
+  #SDL related settings
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -fmessage-length=0 -fPIE -fstack-protector-all -Wstack-protector -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security -fPIC")
 else()
   message(status "Setting MSVC flags")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHc-")
