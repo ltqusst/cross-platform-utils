@@ -55,10 +55,215 @@
 #include <memory>
 #include "ipc.h"
 
+namespace cross{
+
+
+
+//poller is better than service because more flexible and no callback
+ipc_connection_poller::ipc_connection_poller(){
+#ifdef WIN32
+	m_h_io_compl_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	if (m_h_io_compl_port == NULL)
+		THROW_SYSTEM_ERROR("ipc_io_service ctor: CreateIoCompletionPort failed.", GetLastError());
+#endif
+#ifdef linux
+	m_epollFd = epoll_create(m_epollSize);
+	if (m_epollFd < 0)
+		THROW_SYSTEM_ERROR("Poll ctor: epoll_create failed.", errno);
+#endif
+}
+
+OS_HANDLE ipc_connection_poller::native_handle(void){
+#ifdef WIN32
+	return m_h_io_compl_port;
+#endif
+#ifdef linux
+	return m_epollFd;
+#endif
+}
+
+ipc_connection_poller::~ipc_connection_poller(){
+#ifdef WIN32
+	CloseHandle(m_h_io_compl_port);
+#else
+	close(m_epollFd);
+#endif
+}
+
+void ipc_connection_poller::add(ipc_connection * pconn){
+	assert(pconn != NULL);
+
+	OS_HANDLE oshd = pconn->native_handle();
+
+	//simply reject nonsense input
+	if (oshd == INVALID_OS_HANDLE) return;
+
+	ipc_connection* p_conn = m_mapper.get(oshd);
+
+	if (p_conn == NULL) {
+#ifdef WIN32
+		//first time association: register into IO completion port system.
+		//we use the handle as completion key directly to be more compatible with linux/epoll
+		//though this is not the best solution
+		if (NULL == CreateIoCompletionPort(oshd, m_h_io_compl_port, (ULONG_PTR)oshd, 0))
+			THROW_SYSTEM_ERROR("add() CreateIoCompletionPort failed.", GetLastError());
+#else
+		//linux, just add the fd into epoll
+		// we choose level-trigger mode, so blocking socket is enough.
+		//
+		// if we use edge-trigger mode, then we need to drain all available data in cache
+		// using non-blocking socket on each epoll-event, and this can bring some difficulty
+		// to application parser implementation
+		//
+		struct epoll_event event;
+		event.events = EPOLLIN | EPOLLRDHUP;
+		event.data.fd = pconn->native_handle();
+		if(-1 == epoll_ctl(m_epollFd, EPOLL_CTL_ADD, pconn->native_handle(), &event))
+			THROW_SYSTEM_ERROR("add() epoll_ctl failed.", errno);
+#endif
+	}
+	else {
+		//do we need remove previous fd?
+	}
+
+	//internal association is mutable (although CreateIoCompletionPort can be down only once)
+	m_mapper.get(oshd) = pconn;
+}
+
+
+void ipc_connection_poller::del(ipc_connection * pconn){
+	assert(pconn != NULL);
+	OS_HANDLE oshd = pconn->native_handle();
+
+	//simply reject nonsense input
+	if (oshd == INVALID_OS_HANDLE) return;
+
+#ifdef WIN32
+	//no way to un-associate unless we close the file handle
+#else
+	epoll_ctl(m_epollFd, EPOLL_CTL_DEL, oshd, NULL);
+#endif
+
+	//remove from cache
+	m_mapper.erase(oshd);
+}
+
+
+EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
+
+	if(pevt == nullptr)
+		return anERROR(-1) << "pevt is null";
+
+#ifdef WIN32
+		// the I/O completion port will post event on each low-level packet arrival
+		// which means the actuall NumberOfBytes still may less than required.
+		//
+		// but most time it is of the same size as sender's write buffer length
+		//
+		*pevt  = {};
+
+		DWORD NumberOfBytes;
+		ULONG_PTR CompletionKey;
+		LPOVERLAPPED  lpOverlapped;
+		BOOL bSuccess = GetQueuedCompletionStatus(m_h_io_compl_port,
+			&NumberOfBytes,
+			&CompletionKey,
+			&lpOverlapped,
+			m_epollTimeout);
+
+		//Only GetLastError() on failure
+		DWORD dwErr = bSuccess ? 0 : GetLastError();
+
+		if (!bSuccess && ERROR_ABANDONED_WAIT_0 == dwErr)
+			break;
+
+		//Success
+		if (lpOverlapped == NULL) {
+			continue;
+		}
+
+		if (0) {
+			std::error_code ec(dwErr, std::system_category());
+			printf(">>>> %s GetQueuedCompletionStatus() returns bSuccess=%d, NumberOfBytes=%d, lpOverlapped=%p GetLastError=%d %s\n", __FUNCTION__,
+				bSuccess, NumberOfBytes, lpOverlapped, dwErr, ec.message().c_str());
+		}
+
+		if (lpOverlapped->hEvent) {
+			//a sync operation, skip callback
+			continue;
+		}
+
+		//lpOverlapped  is not null
+		// CompletionKey is the file handle
+		// we don't need a map because this Key is the Callback
+		OS_HANDLE oshd = static_cast<OS_HANDLE>((void*)CompletionKey);
+
+		ipc_connection * pconn = m_mapper.get(oshd);
+
+		assert_line(pconn);
+		//do not let exception from one connection terminate whole service thread!
+		try {
+			pconn->notify(dwErr, NumberOfBytes, lpOverlapped, pevt);
+		}
+		catch (std::exception & e) {
+			std::cerr << std::endl << "Exception in " __FUNCTION__ ": " << e.what() << std::endl;
+			return anERROR(-1) << e.what();
+		}
+		catch (...) {
+			std::cerr << std::endl << "Exception in " __FUNCTION__ ": " << "Unknown" << std::endl;
+			return anERROR(-2) << "Unknown exception";
+		}
+
+		return 0;
+#endif
+
+#ifdef linux
+		*pevt = {};
+
+		// Block SIGPIPE signal because remote peer may exit abnormally
+		static std::once_flag flag1;
+		std::call_once(flag1, [](){
+			sigset_t set;
+			sigemptyset(&set);
+			sigaddset(&set, SIGPIPE);
+			int s = pthread_sigmask(SIG_BLOCK, &set, NULL);
+			if (s != 0)
+				THROW_SYSTEM_ERROR("pthread_sigmask failed", s);		//TODO
+		});
+
+		struct epoll_event event;
+		int numEvents = epoll_wait(m_epollFd, &event, 1, m_epollTimeout);
+
+		if(numEvents < 0)
+			return anERROR(-3, errno) << "epoll_wait() error.";
+
+		if(numEvents == 1){
+			int fd = event.data.fd;
+
+			ipc_connection * pconn = m_mapper.get(fd);
+			assert_line(pconn);
+			//do not let exception from one connection terminate whole service thread!
+			try {
+				pconn->notify(0, 0, event.events, pevt);
+			}
+			catch (std::exception & e) {
+				std::cerr << std::endl << "Exception in " << __FUNCTION__ << ": " << e.what() << std::endl;
+				return anERROR(-1) << e.what();
+			}
+			catch (...) {
+				std::cerr << std::endl << "Exception in " << __FUNCTION__ << ": " << "Unknown" << std::endl;
+				return anERROR(-2) << "Unknown exception";
+			}
+		}
+
+		return 0;
+#endif
+}
 
 //==========================================================================================================================
 //service imeplmentation
 
+#if 0
 class ipc_io_service_impl : public ipc_io_service
 {
 public:
@@ -323,7 +528,7 @@ void ipc_io_service_impl::run()
 		}
 #endif
 }
-
+#endif
 //==========================================================================================================================
 //connection imeplmentation
 
@@ -752,195 +957,168 @@ void ipc_connection_win_namedpipe::close(void)
 
 
 #ifdef linux
-
-//Unix Domain Sockets
-class ipc_connection_linux_UDS : public ipc_connection
+ipc_connection_linux_UDS::ipc_connection_linux_UDS(ipc_connection_poller * p) :
+	ipc_connection(p), m_fd(-1), m_name(""), m_state(state::EMPTY)
+{}
+ipc_connection_linux_UDS::~ipc_connection_linux_UDS()
 {
-public:
-	ipc_connection_linux_UDS(ipc_io_service & service, const std::string & serverName);
-	~ipc_connection_linux_UDS();
-
-	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint);
-
-	virtual OS_HANDLE native_handle() { return m_fd; }
-
-	//blocking/sync version(based on async version)
-	virtual void read(void * pbuff, const int len, int *lp_cnt);
-	virtual void write(void * pbuff, const int len);
-
-	virtual void read(OS_HANDLE &oshd);
-	virtual void write(OS_HANDLE oshd);
-
-	//client(blocking is acceptable because usually its short latency)
-	virtual int connect(const std::string & serverName);
-	virtual int listen(void);
-	virtual void close(void);
-protected:
-
-private:
-	ipc_connection_linux_UDS(ipc_io_service & service, int fd);
-	bool set_block_mode(bool makeBlocking = true);
-
-	constexpr static const char * CLI_PATH = "/var/tmp/";
-	constexpr static const int  m_numListen = 5;
-
-	int 					m_fd;
-	const char *			m_name;		//IPC name
-	bool 					m_listening;
-};
-
-ipc_connection_linux_UDS::ipc_connection_linux_UDS(ipc_io_service &service, const std::string & serverName) :
-	ipc_connection(service), m_fd(-1), m_name(""),m_listening(false)
+	m_poller->del(this);
+	close();
+}
+EResult ipc_connection_linux_UDS::accept(ipc_connection * listener)
 {
+	if(m_state != state::EMPTY)
+		return anERROR(-1) << "state is not EMPTY when connect()";
+
+	struct stat statbuf;
 	struct sockaddr_un addr;
 
-	/* create a UNIX domain stream socket */
+	if(listener == nullptr)
+		return anERROR(-99) << "listener is null";
+
+	ipc_connection_linux_UDS * plis = dynamic_cast<ipc_connection_linux_UDS*>(listener);
+	if(plis == nullptr)
+		return anERROR(-98) << "listener is not ipc_connection_linux_UDS";
+
+	socklen_t len = sizeof(addr);
+	if ((m_fd = ::accept(listener->native_handle(), (struct sockaddr *)&addr, &len)) < 0)
+		return anERROR(-1,errno) << "accept failed";     /* often errno=EINTR, if signal caught */
+
+	auto g1 = make_scopeGuard([&]{close();});
+
+	/* obtain the client's uid from its calling address */
+	len -= offsetof(struct sockaddr_un, sun_path); /* len of pathname */
+	addr.sun_path[len] = 0;           /* null terminate */
+
+	if (stat(addr.sun_path, &statbuf) < 0)
+		return anERROR(-2,errno) << "stat failed";
+
+	if (S_ISSOCK(statbuf.st_mode) == 0)
+		return anERROR(-3,errno) << "S_ISSOCK failed";
+
+	__uid_t uid = statbuf.st_uid;   /* return uid of caller */
+	unlink(addr.sun_path);        /* we're done with pathname now */
+
+	m_state = state::CONN;
+	m_poller->add(this);
+	g1.dismiss();
+
+	return 0;
+}
+void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, uintptr_t hint, ipc_poll_event * pevt)
+{
+	if(m_state == state::EMPTY)
+		return;
+
+	//printf(">>>>>>>>>>>>>>> notify : %s,%s\n",hint&EPOLLIN?"EPOLLIN":"",hint&EPOLLRDHUP?"EPOLLRDHUP":"");
+	if ((hint & EPOLLRDHUP) || (hint & EPOLLHUP)) {
+		pevt->e = ipc_poll_event::event::HUP;
+		pevt->pconn = this;
+	}
+	else if (hint & EPOLLIN) {
+		//new data arrived
+		pevt->e = ipc_poll_event::event::IN;
+		pevt->pconn = this;
+		//std::error_code ec(error_code, std::system_category());
+	}
+}
+
+EResult ipc_connection_linux_UDS::connect(const std::string & serverName)
+{
+	if(m_state != state::EMPTY)
+		return anERROR(-1) << "state is not EMPTY when connect()";
+
+	// create a UNIX domain stream socket
 	if ((m_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
-		THROW_SYSTEM_ERROR("ipc_connection_linux_UDS ctor : socket() failed.", errno);
+		return anERROR(-2,errno) << "ipc_connection_linux_UDS : socket() failed.";
 
-	// socket name is not changable, only one bind() can be called
-	// so we treat it as a part of resource acquire process (RAll)
+	auto g1 = make_scopeGuard([&]{close();});
 
-	//memset(&addr, 0, sizeof(addr));
+	{
+		struct sockaddr_un addr = {0};
+		addr.sun_family = AF_UNIX;
 
-	// since its a aggregate C struct, initialize zero can be done this way
-	// make sure it do not have irresponsible default constructor or this may fail
-	// but since its a C struct, we can safely value-initialize it
-	// (https://akrzemi1.wordpress.com/2013/09/10/value-initialization-with-c/)
-
-	addr = {};
-	addr.sun_family = AF_UNIX;
-
-	std::string sun_path = serverName;
-	if (sun_path.empty()) {
 		//client socket do not have server name, build one for it
 		std::ostringstream stringStream;
 		stringStream << CLI_PATH;
 		stringStream << std::setw(5) << std::setfill('0') << getpid();
-		sun_path = stringStream.str();
+		std::string sun_path = stringStream.str();
+
+		::unlink(sun_path.c_str());
+
+		int cnt = string_copy(addr.sun_path, sun_path);
+		int len = offsetof(sockaddr_un, sun_path) + cnt + 1;
+
+		if (::bind(m_fd, (struct sockaddr*)&addr, len) < 0)
+			return anERROR(-3, errno) << "ipc_connection_linux_UDS : bind() failed.";
 	}
 
-	::unlink(sun_path.c_str());
+	{
+		struct sockaddr_un addr = {0};
+		addr.sun_family = AF_UNIX;
+		/* fill socket address structure with server's address */
+		int cnt = string_copy(addr.sun_path, serverName);
+		int len = offsetof(struct sockaddr_un, sun_path) + cnt + 1;
 
-	int cnt = string_copy(addr.sun_path, sun_path);
-	int len = offsetof(sockaddr_un, sun_path) + cnt + 1;
-
-	if (::bind(m_fd, (struct sockaddr*)&addr, len) < 0) 
-		THROW_SYSTEM_ERROR("ipc_connection_linux_UDS ctor : bind() failed.", errno);
-
-	service.associate(this);
-}
-ipc_connection_linux_UDS::ipc_connection_linux_UDS(ipc_io_service & service, int fd) :
-	ipc_connection(service), m_fd(fd), m_name(""), m_listening(false)
-{
-	service.associate(this);
-}
-ipc_connection_linux_UDS::~ipc_connection_linux_UDS()
-{
-	m_service.unassociate(this);
-	close();
-}
-
-void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, uintptr_t hint)
-{
-	//printf(">>>>>>>>>>>>>>> notify : %s,%s\n",hint&EPOLLIN?"EPOLLIN":"",hint&EPOLLRDHUP?"EPOLLRDHUP":"");
-
-	//if we are listening socket, 		do on_accept on EPOLLIN
-	//
-	//	to be consistent with common behavior, we just
-	//  accept the connection and return connected connection to user.
-	//
-	//if we are communication socket, 	do on_read on EPOLLIN
-	//
-	if (m_listening && (hint & EPOLLIN)) {
-		int clifd;
-		struct stat statbuf;
-		struct sockaddr_un addr;
-
-		socklen_t len = sizeof(addr);
-		if ((clifd = ::accept(m_fd, (struct sockaddr *)&addr, &len)) < 0) {
-			//HError("accept error: %s\n", strerror(errno));
-			THROW_SYSTEM_ERROR("notify() accept failed.", errno);
-			return;     /* often errno=EINTR, if signal caught */
-		}
-
-		if (on_accept) {
-			/* obtain the client's uid from its calling address */
-			len -= offsetof(struct sockaddr_un, sun_path); /* len of pathname */
-			addr.sun_path[len] = 0;           /* null terminate */
-
-			if (stat(addr.sun_path, &statbuf) < 0) {
-				//HError("stat error: %s\n", strerror(errno));
-				::close(clifd);
-				THROW_SYSTEM_ERROR("notify() stat failed.", errno);
-				return;
-			}
-
-			if (S_ISSOCK(statbuf.st_mode) == 0) {
-				//HError("S_ISSOCK error: %s\n", strerror(errno));
-				//rval = -3;      /* not a socket */
-				::close(clifd);
-				THROW_SYSTEM_ERROR("notify() S_ISSOCK failed.", errno);
-				return;
-			}
-			__uid_t uid = statbuf.st_uid;   /* return uid of caller */
-			unlink(addr.sun_path);        /* we're done with pathname now */
-
-			ipc_connection_linux_UDS * pconn = new ipc_connection_linux_UDS(get_service(), clifd);
-
-			on_accept(static_cast<ipc_connection *>(pconn));
-		}
-
+		if (::connect(m_fd, (struct sockaddr *)&addr, len) < 0)
+			return anERROR(-4,errno) << "::connect() to " << serverName << " failed.";
 	}
-	else if ((hint & EPOLLRDHUP) || (hint & EPOLLHUP)) {
-		if (on_close)
-			on_close(this);
-	}
-	else if (hint & EPOLLIN) {
-		//new data arrived
-		std::error_code ec(error_code, std::system_category());
-		if (on_read)
-			on_read(this, ec, transferred_cnt);
-	}
-}
 
-int ipc_connection_linux_UDS::connect(const std::string & serverName)
-{
-	int len;
-	struct sockaddr_un addr = { 0 };
-
-	/* fill socket address structure with server's address */
-	addr.sun_family = AF_UNIX;
-
-	int cnt = string_copy(addr.sun_path, serverName);
-
-	len = offsetof(struct sockaddr_un, sun_path) + cnt + 1;
-
-	if (::connect(m_fd, (struct sockaddr *)&addr, len) < 0) {
-		THROW_SYSTEM_ERROR("connect() connect failed.", errno);
-		//HError("connect error: %s\n", strerror(errno));
-		return errno;
-	}
+	m_state = state::CONN;
+	m_poller->add(this);
+	g1.dismiss();
 
 	return 0;
 }
-int ipc_connection_linux_UDS::listen(void)
+EResult ipc_connection_linux_UDS::listen(const std::string & serverName)
 {
-	if (!m_listening) {
-		if (::listen(m_fd, m_numListen) < 0) {
-			THROW_SYSTEM_ERROR("listen() listen failed.", errno);
-			return errno;
+	if(m_state != state::EMPTY)
+		return anERROR(-1) << "state is not EMPTY when listen()";
+
+	// create a UNIX domain stream socket
+	if ((m_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+		return anERROR(-2,errno) << "ipc_connection_linux_UDS : socket() failed.";
+
+	auto g1 = make_scopeGuard([&]{close();});
+
+	{
+		struct sockaddr_un addr = {0};
+		addr.sun_family = AF_UNIX;
+
+		std::string sun_path = serverName;
+		if (sun_path.empty()) {
+			//client socket do not have server name, build one for it
+			std::ostringstream stringStream;
+			stringStream << CLI_PATH;
+			stringStream << std::setw(5) << std::setfill('0') << getpid();
+			sun_path = stringStream.str();
 		}
-		m_listening = true;
+
+		::unlink(sun_path.c_str());
+
+		int cnt = string_copy(addr.sun_path, sun_path);
+		int len = offsetof(sockaddr_un, sun_path) + cnt + 1;
+
+		if (::bind(m_fd, (struct sockaddr*)&addr, len) < 0)
+			return anERROR(-3, errno) << "ipc_connection_linux_UDS : bind() failed.";
+
+		if (::listen(m_fd, m_numListen) < 0)
+			return anERROR(-4,errno) << "listen failed";
 	}
+
+	m_state = state::LISTEN;
+	m_poller->add(this);
+	g1.dismiss();
+
 	return 0;
 }
 
-void ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int * lp_cnt)
+EResult ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int * lp_cnt)
 {
 	if (m_fd <= 0 || !buffer || bufferSize <= 0) {
 		assert_line(0);
-		THROW_(std::invalid_argument, "ipc_connection_linux_UDS::read");
+		//THROW_(std::invalid_argument, "ipc_connection_linux_UDS::read");
+		return anERROR(-1) << "read got invalid argument.";
 	}
 
 	char *ptr = static_cast<char*>(buffer);
@@ -956,7 +1134,8 @@ void ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int * l
 		}
 		else if (readBytes < 0) {
 			if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-				THROW_SYSTEM_ERROR("read failed ", errno);
+				//THROW_SYSTEM_ERROR("read failed ", errno);
+				return anERROR(-2,errno) << "read failed.";
 				//if exception is banned, we just stop further processing
 				break;
 			}
@@ -976,18 +1155,21 @@ void ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int * l
 
 	if (lp_cnt)
 		*lp_cnt = (bufferSize - leftBytes);
-
+	else
+		if(leftBytes > 0)
+			return anERROR(-3) << " leftBytes=" << leftBytes;
 	//fprintf(stderr,"read %d bytes, with errno = %d: %s\n", bufferSize - leftBytes, err, strerror(err));
-	return;
+	return 0;
 }
 
-void ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
+EResult ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
 {
 
 	if (m_fd <= 0 || !buffer || bufferSize <= 0) {
 		//return -1;
-		assert_line(0);
-		THROW_(std::invalid_argument, "ipc_connection_linux_UDS::write");
+		return anERROR(-1) << "invalid argument: m_fd=" << m_fd
+						  << " buffer=" << buffer
+						  << " bufferSize=" << bufferSize;
 	}
 
 	char *ptr = static_cast<char*>(buffer);
@@ -999,7 +1181,8 @@ void ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
 			if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
 				//err = errno;
 				//fprintf(stderr, "write failed with %d: %s\n", errno, strerror(errno));
-				THROW_SYSTEM_ERROR("write failed ", errno);
+				//THROW_SYSTEM_ERROR("write failed ", errno);
+				return anERROR(-1, errno) << "write failed.";
 				break;
 			}
 			writeBytes = 0;
@@ -1009,7 +1192,7 @@ void ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
 		leftBytes -= writeBytes;
 	}
 
-	return;
+	return 0;
 }
 void ipc_connection_linux_UDS::read(OS_HANDLE &oshd)
 {
@@ -1042,29 +1225,14 @@ bool ipc_connection_linux_UDS::set_block_mode(bool makeBlocking)
 void ipc_connection_linux_UDS::close(void)
 {
 	if (m_fd >= 0) {
+		m_poller->del(this);
 		::close(m_fd);
 		m_fd = -1;
 	}
+	m_state = state::EMPTY;
 }
 #endif
 
 
 
-ipc_connection::Ptr ipc_connection::create(ipc_io_service * p_service, const char* ipc_type, const char * server_name)
-{
-	assert(server_name);
-	assert(p_service);
-#ifdef WIN32
-	if (strcmp(ipc_type, "") == 0 ||
-		strcmp(ipc_type, "win_namedpipe") == 0) {
-		return ipc_connection::Ptr(new ipc_connection_win_namedpipe(*p_service, server_name));
-	}
-#endif
-#ifdef linux
-	if (strcmp(ipc_type, "") == 0 ||
-		strcmp(ipc_type, "linux_UDS") == 0) {
-		return ipc_connection::Ptr(new ipc_connection_linux_UDS(*p_service, server_name));
-	}
-#endif
-	return NULL;
 }

@@ -30,44 +30,67 @@ typedef int OS_HANDLE;
 //
 // they are not value-type but identity-type, so pure-virtual class is a way to hide impletation better than pimpl
 //    https://stackoverflow.com/questions/825018/pimpl-idiom-vs-pure-virtual-class-interface
-
-class ipc_connection;
-class ipc_io_service;
-
 #include "utils.h"
 
-class ipc_io_service: public NonCopyable
+
+namespace cross
 {
+
+// we have to allow dangling wrapper because no exception is allowed here
+// so we do not use RAll, the class is much more like OS handle which is
+// allowed to be in dangling/zombie state, and call member function on
+// zombie object will trigger an error as the downside.
+//
+// even so, wrapper still have chance to release the resource on self-destruction
+// to allow resource free automatically as the upside.(so we can return freely)
+
+
+class ipc_connection;
+class ipc_connection_poller;
+
+template<class KEY>
+class fast_mapper
+{
+	static const int					m_map_fast_size = 1024;
+	std::mutex							m_mutex;
+	ipc_connection *					m_map_fast[m_map_fast_size];
+	std::map<KEY, ipc_connection*>		m_map;
 public:
-	typedef std::shared_ptr<ipc_io_service> Ptr;
+	ipc_connection* & get(KEY oshd){
+		std::unique_lock<std::mutex> lk(m_mutex);
+		unsigned long v = (unsigned long)oshd;
+		if (v >= 0 && v < m_map_fast_size)
+			return m_map_fast[v];
 
-	static ipc_io_service::Ptr create(const char* type = "");
+		if (m_map.find(oshd) == m_map.end())
+			m_map.insert(std::make_pair(oshd, (ipc_connection*)NULL));
 
-	virtual ~ipc_io_service() {};
-	virtual void run() = 0;
-	virtual void stop() = 0;
-	virtual void associate(ipc_connection * pconn) = 0;
-	virtual void unassociate(ipc_connection * pconn) = 0;
-	virtual OS_HANDLE native_handle(void) = 0;
-protected:
-	ipc_io_service() {};
+		return m_map[oshd];
+	}
+	void erase(KEY oshd){
+		std::unique_lock<std::mutex> lk(m_mutex);
+		unsigned long v = (unsigned long)oshd;
+		if (v >= 0 && v < m_map_fast_size) {
+			m_map_fast[v] = NULL;
+			return;
+		}
+		auto it = m_map.find(oshd);
+		if (it != m_map.end())
+			m_map.erase(it);
+	}
 };
 
+struct ipc_poll_event
+{
+	enum class event{NONE=0, IN, HUP} 	e = event::NONE;
+	ipc_connection	*						pconn = nullptr;
+};
 
 class ipc_connection : public NonCopyable
 {
 public:
-	typedef std::shared_ptr<ipc_connection> Ptr;
-
-	static ipc_connection::Ptr create(ipc_io_service * p_service, const char* ipc_type, const char* server_name = "");
-	
-	virtual ~ipc_connection() {}
+	virtual ~ipc_connection(){};
 	virtual OS_HANDLE native_handle() = 0;
-	virtual ipc_io_service & get_service() { return m_service; }
-
-	//on Windows, notify means one IO request is completed or error occured
-	//on Linux, notify means one IO request type is ready to issue without blocking
-	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint) = 0;
 
 	//blocking/sync version
 	//  based on async version, so they cannot be called within async handler!
@@ -78,25 +101,108 @@ public:
 	//		1. response by using async_write
 	//      2. dispatch the response task to another thread, and in that thread, 
 	//         sync version IO can be used without blocking io_service.
-	virtual void read(void * pbuff, const int len, int *lp_cnt = NULL) = 0;
-	virtual void write(void * pbuff, const int len) = 0;
+	virtual EResult read(void * pbuff, const int len, int *lp_cnt = NULL) = 0;
+	virtual EResult write(void * pbuff, const int len) = 0;
 
 	//can be used on duplicate fd(file descriptor) on Linux or File Handle on Windows
 	virtual void read(OS_HANDLE &oshd) = 0;
 	virtual void write(OS_HANDLE oshd) = 0;
 
-	//client(blocking is acceptable because usually its short latency)
-	virtual int connect(const std::string & serverName) = 0;
-	virtual int listen(void) = 0;
-	virtual void close(void) = 0; //close connection
+	//the real creation of the underlying resource
+	virtual EResult connect(const std::string & serverName) = 0;
+	virtual EResult listen(const std::string & serverName) = 0;
+	virtual EResult accept(ipc_connection * listener) = 0;
 
-	//async callbacks are free for register by simple assign
-	std::function<void(ipc_connection * pconn, const std::error_code & ec, std::size_t len)>	on_read;
-	std::function<void(ipc_connection * pconn)>													on_accept;
-	std::function<void(ipc_connection * pconn)>													on_close;
+	//close underlying resource
+	virtual void close(void) = 0;
+
+	friend class ipc_connection_poller;
+
 protected:
-	ipc_connection(ipc_io_service & s) :m_service(s) {}
-	ipc_io_service &    	m_service;
+
+	//on Windows, notify means one IO request is completed or error occured
+	//on Linux, notify means one IO request type is ready to issue without blocking
+	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint, ipc_poll_event * pevt) = 0;
+
+	ipc_connection(ipc_connection_poller * p):m_poller(p){};
+	ipc_connection_poller *    	m_poller;
 };
+
+
+
+class ipc_connection_poller: public NonCopyable
+{
+	//a general mapping facility
+	fast_mapper<OS_HANDLE>	m_mapper;
+
+	static const int        		m_epollTimeout = 100;
+#ifdef WIN32
+	OS_HANDLE						m_h_io_compl_port;
+#else
+	//Linux
+	static const int 				m_epollSize = 1000;
+	int								m_epollFd;
+#endif
+
+public:
+	ipc_connection_poller();
+	~ipc_connection_poller();
+	void add(ipc_connection * pconn);
+	void del(ipc_connection * pconn);
+	EResult wait(ipc_poll_event * pevt);
+
+	OS_HANDLE native_handle(void);
+};
+
+
+
+
+#ifdef linux
+//Unix Domain Sockets
+class ipc_connection_linux_UDS : public ipc_connection
+{
+public:
+	//bare minimum constructor
+	ipc_connection_linux_UDS(ipc_connection_poller * p);
+	~ipc_connection_linux_UDS();
+
+	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint, ipc_poll_event * pevt);
+
+	virtual OS_HANDLE native_handle() { return m_fd; }
+
+	//blocking/sync version(based on async version)
+	virtual EResult read(void * pbuff, const int len, int *lp_cnt = NULL);
+	virtual EResult write(void * pbuff, const int len);
+
+	virtual void read(OS_HANDLE &oshd);
+	virtual void write(OS_HANDLE oshd);
+
+	//client(blocking is acceptable because usually its short latency)
+	virtual void close(void);
+
+	//the real creation of the underlying resource
+	virtual EResult connect(const std::string & serverName);
+	virtual EResult listen(const std::string & serverName);
+	virtual EResult accept(ipc_connection * listener);
+
+protected:
+	bool set_block_mode(bool makeBlocking = true);
+
+	constexpr static const char * CLI_PATH = "/var/tmp/";
+	constexpr static const int  m_numListen = 5;
+
+	int 					m_fd;
+	const char *			m_name;		//IPC name
+
+	enum class state {EMPTY=0, LISTEN, CONN, DISCONN}	m_state;
+};
+#endif
+
+#ifdef WIN32
+
+#endif
+
+
+}
 
 #endif

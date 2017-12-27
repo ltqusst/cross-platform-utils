@@ -1,20 +1,27 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.2)
 project(cross-platform-utils)
 
 set (CMAKE_CXX_STANDARD 11)
 
-#platform dependent FLAGS
-if (UNIX)
-  message(status "Setting GCC flags")
-  #need pthread because C++11 on Linux depends on it
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
-  
-  #SDL related settings
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -fmessage-length=0 -fPIE -fstack-protector-all -Wstack-protector -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security -fPIC")
+include(helper.cmake)
+
+#platform dependent compiler options
+if (MSVC)
+add_compile_options("/EHc-")
 else()
-  message(status "Setting MSVC flags")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHc-")
+#need pthread because C++11 on Linux depends on it
+add_compile_options("-lpthread")
+add_compile_options("-Wall")
+add_compile_options("-fmessage-length=0")
+add_compile_options("-fPIE")
+add_compile_options("-fstack-protector-all")
+add_compile_options("-Wstack-protector")
+add_compile_options("-D_FORTIFY_SOURCE=2")
+add_compile_options("-Wformat")
+add_compile_options("-Wformat-security")
+add_compile_options("-fPIC")
 endif()
+
 
 #include(GNUInstallDirs)
 #message(status "** CMAKE_INSTALL_LIBDIR: ${CMAKE_INSTALL_LIBDIR}")
@@ -28,15 +35,26 @@ add_library(${TARGET_LIB} STATIC
 				src/ipc.cpp 
 				inc/ipc.h 
 				inc/utils.h)
-target_include_directories(${TARGET_LIB} PUBLIC inc)
+				
+target_include_directories	(${TARGET_LIB} PUBLIC inc)
+target_link_libraries		(${TARGET_LIB} INTERFACE pthread)
 
 set_target_properties(${TARGET_LIB} PROPERTIES PUBLIC_HEADER "inc/ipc.h;inc/utils.h")
 
 install (TARGETS ${TARGET_LIB}
-         RUNTIME DESTINATION 		${PROJECT_SOURCE_DIR}/_install
-         LIBRARY DESTINATION 		${PROJECT_SOURCE_DIR}/_install/lib
-		 ARCHIVE DESTINATION 		${PROJECT_SOURCE_DIR}/_install/lib
-		 PUBLIC_HEADER DESTINATION 	${PROJECT_SOURCE_DIR}/_install/include)
+         RUNTIME DESTINATION 		${CMAKE_INSTALL_PREFIX}/${TARGET_LIB}/lib
+         LIBRARY DESTINATION 		${CMAKE_INSTALL_PREFIX}/${TARGET_LIB}/lib
+		 ARCHIVE DESTINATION 		${CMAKE_INSTALL_PREFIX}/${TARGET_LIB}/lib
+		 PUBLIC_HEADER DESTINATION 	${CMAKE_INSTALL_PREFIX}/${TARGET_LIB}/include)
 
 add_subdirectory(test)
 
+#print_target_properties(${TARGET_LIB})
+#print_target_properties(test-ipc)
+enable_testing()
+add_test(NAME test_ipc1 COMMAND arg1 arg2 ... )
+
+
+set(CPACK_GENERATOR "DEB")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "tingqian.li@intel.com")
+include(CPack)
