@@ -18,7 +18,7 @@ using ipc_conn = cross::ipc_connection_linux_UDS;
 
 #ifdef WIN32
 static LPTSTR servername = TEXT("\\\\.\\pipe\\mynamedpipe");
-typedef ipc_connection_namedpipe ipc_conn;
+using ipc_conn = cross::ipc_connection_win_namedpipe;
 #endif
 
 

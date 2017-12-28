@@ -11,8 +11,6 @@ class server_conn:public ipc_conn
 {
 public:
 
-	bool b_exit = false;
-
 	server_conn(cross::ipc_connection_poller *p):ipc_conn(p){
 		tst1_count = 0;
 	}
@@ -29,9 +27,19 @@ public:
 		char buff_rx[1024];
 		int len = sizeof(buff_rx);
 
+		if (tst1_id == 0) {
+			tst1_tim1 = std::chrono::steady_clock::now();
+			tst1_ms0 = 0;
+		}
+		
 		if (len > tst1_count - tst1_id) len = tst1_count - tst1_id;
 
-		read(buff_rx, len);
+		auto err = read(buff_rx, len);
+		if (err) {
+			std::cerr << "on_tst1() read failed:" << std::endl;
+			std::cerr << err.message() << std::endl;
+			return;
+		}
 
 		for (int k = 0; k < len && tst1_id < tst1_count; k++, tst1_id++) {
 			if (buff_rx[k] != (char)tst1_id)
@@ -42,7 +50,7 @@ public:
 
 		auto time2 = std::chrono::steady_clock::now();
 		auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(time2 - tst1_tim1);;
-		if (ms.count() > tst1_ms0 + 1000	 || tst1_id >= tst1_count) {
+		if ((ms.count() > tst1_ms0 + 1000) || (tst1_id >= tst1_count)) {
 			tst1_ms0 = ms.count();
 			std::cerr << "Client [" << native_handle() << "]" << (tst1_id>>10) << "KB/" << (tst1_count>>10)
 					<< "KB  (" << (int64_t)tst1_id * 100 / tst1_count << "%)  "
@@ -57,7 +65,7 @@ public:
 	}
 
 
-	bool on_read(){
+	bool on_request(){
 		using namespace cross;
 		EResult err;
 		char buff_tx[1024];
@@ -77,9 +85,7 @@ public:
 			//server_tst1();
 			if(read(&tst1_count, sizeof(tst1_count)))
 				return false;
-
 			std::cout << "Client [" << native_handle() << "] tst1 on " << tst1_count << " bytes:" << std::endl;
-			tst1_tim1 = std::chrono::steady_clock::now();
 			tst1_id = 0;
 			return false;
 		}
@@ -160,7 +166,7 @@ static cross::EResult server(int argc, char * argv[])
 		if(evt.pconn == NULL)
 			continue;
 
-		if(evt.pconn == listener.get() && evt.e == ipc_poll_event::event::IN){
+		if(evt.pconn == listener.get() && evt.e == ipc_poll_event::event::POLLIN){
 			//acceptor
 			server_conn * pconn = new server_conn(poller.get());
 
@@ -174,16 +180,14 @@ static cross::EResult server(int argc, char * argv[])
 		//client connections
 		switch(evt.e)
 		{
-			case ipc_poll_event::event::IN:
+			case ipc_poll_event::event::POLLIN:
 			{
-				server_conn * pconn = (server_conn *)evt.pconn;
-				pconn->on_read();
-
-				if(pconn->b_exit)
+				server_conn * pserver_conn = (server_conn *)evt.pconn;
+				if(pserver_conn->on_request())
 					b_exit.store(true);
 			}
 			break;
-			case ipc_poll_event::event::HUP:
+			case ipc_poll_event::event::POLLHUP:
 			{
 				std::cout << "Client [" << evt.pconn->native_handle() << "] closed and deleted\n";
 

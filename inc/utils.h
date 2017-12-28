@@ -41,6 +41,7 @@
 #include <map>
 #include <tuple>
 #include <deque>
+#include <queue>
 #include <atomic>
 #include <iostream>
 #include <thread>
@@ -61,7 +62,7 @@ namespace cross
 // a safe replacement for strcpy
 // let compiler deduce destsz whenever possible
 template<size_t destsz>
-int string_copy(char(&dest)[destsz], const std::string & str, size_t pos = 0)
+size_t string_copy(char(&dest)[destsz], const std::string & str, size_t pos = 0)
 {
 #ifdef WIN32
 	strcpy_s(dest, destsz, str.c_str() + pos);
@@ -323,6 +324,7 @@ static int getPID()
 #endif
 
 #ifdef WIN32
+	return ::GetCurrentProcessId();
 #endif
 }
 

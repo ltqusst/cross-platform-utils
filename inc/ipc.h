@@ -53,12 +53,12 @@ class fast_mapper
 {
 	static const int					m_map_fast_size = 1024;
 	std::mutex							m_mutex;
-	ipc_connection *					m_map_fast[m_map_fast_size];
+	ipc_connection *					m_map_fast[m_map_fast_size] = {0};
 	std::map<KEY, ipc_connection*>		m_map;
 public:
 	ipc_connection* & get(KEY oshd){
 		std::unique_lock<std::mutex> lk(m_mutex);
-		unsigned long v = (unsigned long)oshd;
+		auto v = key2int(oshd, std::is_pointer<KEY>());
 		if (v >= 0 && v < m_map_fast_size)
 			return m_map_fast[v];
 
@@ -69,7 +69,7 @@ public:
 	}
 	void erase(KEY oshd){
 		std::unique_lock<std::mutex> lk(m_mutex);
-		unsigned long v = (unsigned long)oshd;
+		auto v = key2int(oshd, std::is_pointer<KEY>());
 		if (v >= 0 && v < m_map_fast_size) {
 			m_map_fast[v] = NULL;
 			return;
@@ -78,11 +78,20 @@ public:
 		if (it != m_map.end())
 			m_map.erase(it);
 	}
+
+	int key2int(KEY k, std::false_type) {
+		//not pointer
+		return static_cast<int>(k);
+	}
+	int key2int(KEY k, std::true_type) {
+		//pointer type 
+		return static_cast<int>(reinterpret_cast<uintptr_t>(k));
+	}
 };
 
 struct ipc_poll_event
 {
-	enum class event{NONE=0, IN, HUP} 	e = event::NONE;
+	enum class event{NONE=0, POLLIN, POLLHUP} 	e = event::NONE;
 	ipc_connection	*						pconn = nullptr;
 };
 
@@ -136,6 +145,10 @@ class ipc_connection_poller: public NonCopyable
 	fast_mapper<OS_HANDLE>	m_mapper;
 
 	static const int        		m_epollTimeout = 100;
+
+
+	std::queue < std::function<void()> > m_prewait_callbacks;
+
 #ifdef WIN32
 	OS_HANDLE						m_h_io_compl_port;
 #else
@@ -150,6 +163,15 @@ public:
 	void add(ipc_connection * pconn);
 	void del(ipc_connection * pconn);
 	EResult wait(ipc_poll_event * pevt);
+
+	
+	//queue prewait callbacks helper function 
+	// make sure the callback do not throw exception or return error code
+	template<typename _Callable, typename... _Args>
+	void queue_prewait_callback(_Callable&& __f, _Args&&... __args){
+		std::function<void()> func = std::bind(std::forward<_Callable>(__f), std::forward<_Args>(__args)...);
+		m_prewait_callbacks.push(func);
+	}
 
 	OS_HANDLE native_handle(void);
 };
@@ -199,7 +221,54 @@ protected:
 #endif
 
 #ifdef WIN32
+class ipc_connection_win_namedpipe : public ipc_connection
+{
+public:
+	ipc_connection_win_namedpipe(ipc_connection_poller * p);
+	~ipc_connection_win_namedpipe();
+	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint, ipc_poll_event * pevt);
 
+	virtual OS_HANDLE native_handle() { return m_oshd; }
+
+	//blocking/sync version(based on async version)
+	virtual EResult read(void * pbuff, const int len, int *lp_cnt = NULL);
+	virtual EResult write(void * pbuff, const int len);
+
+	//can be used on duplicate fd(file descriptor) on Linux or File Handle on Windows
+	virtual void read(OS_HANDLE &oshd);
+	virtual void write(OS_HANDLE oshd);
+
+	virtual EResult connect(const std::string & serverName);
+	virtual EResult listen(const std::string & serverName);
+	virtual EResult accept(ipc_connection * listener);
+
+	virtual void close(void);
+
+protected:
+
+private:
+
+	friend class ipc_connection_poller;
+
+	EResult wait_for_connection(void);
+	void trigger_async_cache_read(void);
+
+	HANDLE					m_oshd;
+
+	// <0 means no cached byte0
+	// >0 means 1 byte is cached and should be filled to user's buffer first
+	unsigned char			m_cache_byte0;
+	bool					m_cache_empty;
+	OVERLAPPED				m_cache_overlapped;
+	OVERLAPPED				m_error_overlapped;
+	OVERLAPPED				m_waitconn_overlapped;
+	OVERLAPPED				m_sync_overlapped;
+
+	std::string				m_name;		//IPC name
+	enum class state { EMPTY = 0, LISTEN, CONN, DISCONN }	m_state;
+
+	friend std::ostream& operator<<(std::ostream& s, const ipc_connection_win_namedpipe::state & d);
+};
 #endif
 
 

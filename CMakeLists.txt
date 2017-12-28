@@ -8,6 +8,7 @@ include(helper.cmake)
 #platform dependent compiler options
 if (MSVC)
 add_compile_options("/EHc-")
+message(status "** MSVC version **")
 else()
 #need pthread because C++11 on Linux depends on it
 add_compile_options("-lpthread")
@@ -20,13 +21,13 @@ add_compile_options("-D_FORTIFY_SOURCE=2")
 add_compile_options("-Wformat")
 add_compile_options("-Wformat-security")
 add_compile_options("-fPIC")
+message(status "** Non MSVC version **")
 endif()
 
 
 #include(GNUInstallDirs)
 #message(status "** CMAKE_INSTALL_LIBDIR: ${CMAKE_INSTALL_LIBDIR}")
 #message(status "** CMAKE_INSTALL_INCLUDEDIR: ${CMAKE_INSTALL_INCLUDEDIR}")
-
 message(status "** CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 
 set(TARGET_LIB "cross-platform-utils")
@@ -37,7 +38,11 @@ add_library(${TARGET_LIB} STATIC
 				inc/utils.h)
 				
 target_include_directories	(${TARGET_LIB} PUBLIC inc)
-target_link_libraries		(${TARGET_LIB} INTERFACE pthread)
+
+if(UNIX)
+	# UNIX system requires user link with pthread because C++11 requires
+	target_link_libraries		(${TARGET_LIB} INTERFACE pthread)
+endif()
 
 set_target_properties(${TARGET_LIB} PROPERTIES PUBLIC_HEADER "inc/ipc.h;inc/utils.h")
 
@@ -50,11 +55,19 @@ install (TARGETS ${TARGET_LIB}
 add_subdirectory(test)
 
 #print_target_properties(${TARGET_LIB})
-#print_target_properties(test-ipc)
+#print_target_properties(ipc_client)
+#print_target_properties(ipc_server)
+
 enable_testing()
 add_test(NAME test_ipc1 COMMAND arg1 arg2 ... )
 
-
+if(UNIX)
 set(CPACK_GENERATOR "DEB")
+endif()
+
+if(WIN32)
+set(CPACK_GENERATOR "NSIS")
+endif()
+
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "tingqian.li@intel.com")
 include(CPack)

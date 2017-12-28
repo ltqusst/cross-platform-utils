@@ -52,7 +52,7 @@ static cross::EResult client(int argc, char * argv[])
 
 			switch(evt.e)
 			{
-				case ipc_poll_event::event::IN:
+				case ipc_poll_event::event::POLLIN:
 				{
 					std::cout << "Server:";
 					int cnt = 0;
@@ -63,7 +63,7 @@ static cross::EResult client(int argc, char * argv[])
 					std::cout << std::endl;
 				}
 				break;
-				case ipc_poll_event::event::HUP:
+				case ipc_poll_event::event::POLLHUP:
 				{
 					std::cout << "Server closed??" << evt.pconn->native_handle() << std::endl;
 					b_exit.store(true);

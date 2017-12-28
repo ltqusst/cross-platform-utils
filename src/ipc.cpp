@@ -154,6 +154,13 @@ EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
 	if(pevt == nullptr)
 		return anERROR(-1) << "pevt is null";
 
+	//empty the callbacks(errors will be silient)
+	while (!m_prewait_callbacks.empty()) {
+		std::function<void()> func = m_prewait_callbacks.front();
+		m_prewait_callbacks.pop();
+		func();
+	}
+
 #ifdef WIN32
 		// the I/O completion port will post event on each low-level packet arrival
 		// which means the actuall NumberOfBytes still may less than required.
@@ -171,26 +178,24 @@ EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
 			&lpOverlapped,
 			m_epollTimeout);
 
-		//Only GetLastError() on failure
-		DWORD dwErr = bSuccess ? 0 : GetLastError();
+		DWORD dwErr = bSuccess ? 0 : (::GetLastError());
 
-		if (!bSuccess && ERROR_ABANDONED_WAIT_0 == dwErr)
-			break;
+		if (WAIT_TIMEOUT == dwErr)
+			return 0;//no result on timeout
 
-		//Success
-		if (lpOverlapped == NULL) {
-			continue;
-		}
+		if (ERROR_ABANDONED_WAIT_0 == dwErr)
+			return anERROR(-1, dwErr) << "Completion port handle closed.";
+
+		if (lpOverlapped == NULL) 
+			return anERROR(-2, dwErr) << "GetQueuedCompletionStatus() failed.";
+
+		//SYNC OP failure also cause IO port return, ignore that
+		if (lpOverlapped && lpOverlapped->hEvent)
+			return 0;
 
 		if (0) {
-			std::error_code ec(dwErr, std::system_category());
-			printf(">>>> %s GetQueuedCompletionStatus() returns bSuccess=%d, NumberOfBytes=%d, lpOverlapped=%p GetLastError=%d %s\n", __FUNCTION__,
-				bSuccess, NumberOfBytes, lpOverlapped, dwErr, ec.message().c_str());
-		}
-
-		if (lpOverlapped->hEvent) {
-			//a sync operation, skip callback
-			continue;
+			printf(">>>> %s GetQueuedCompletionStatus() returns bSuccess=%d, NumberOfBytes=%d, lpOverlapped=%p \n", __FUNCTION__,
+				bSuccess, NumberOfBytes, lpOverlapped);
 		}
 
 		//lpOverlapped  is not null
@@ -203,17 +208,17 @@ EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
 		assert_line(pconn);
 		//do not let exception from one connection terminate whole service thread!
 		try {
-			pconn->notify(dwErr, NumberOfBytes, lpOverlapped, pevt);
+			pconn->notify(dwErr, NumberOfBytes, (uintptr_t)lpOverlapped, pevt);
 		}
 		catch (std::exception & e) {
 			std::cerr << std::endl << "Exception in " __FUNCTION__ ": " << e.what() << std::endl;
-			return anERROR(-1) << e.what();
+			return anERROR(-3) << e.what();
 		}
 		catch (...) {
 			std::cerr << std::endl << "Exception in " __FUNCTION__ ": " << "Unknown" << std::endl;
-			return anERROR(-2) << "Unknown exception";
+			return anERROR(-4) << "Unknown exception";
 		}
-
+		
 		return 0;
 #endif
 
@@ -261,472 +266,92 @@ EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
 }
 
 //==========================================================================================================================
-//service imeplmentation
-
-#if 0
-class ipc_io_service_impl : public ipc_io_service
-{
-public:
-	ipc_io_service_impl();
-	~ipc_io_service_impl();
-	virtual void run();
-	virtual void stop();
-	virtual void associate(ipc_connection * pconn) ;
-	virtual void unassociate(ipc_connection * pconn);
-	virtual OS_HANDLE native_handle(void);
-
-private:
-	static const int        m_epollTimeout = 100;
-	std::atomic<bool>		m_exit;
-	std::mutex				m_mutex;
-
-	//a general mapping facility
-	static const int							m_map_fast_size = 1024;
-	ipc_connection *							m_map_fast[m_map_fast_size];
-	std::map<OS_HANDLE, ipc_connection*>		m_map;
-
-	ipc_connection* & get(OS_HANDLE oshd)
-	{
-		std::unique_lock<std::mutex> lk(m_mutex);
-		unsigned long v = (unsigned long)oshd;
-		if (v >= 0 && v < m_map_fast_size)
-			return m_map_fast[v];
-
-		if (m_map.find(oshd) == m_map.end())
-			m_map.insert(std::make_pair(oshd, (ipc_connection*)NULL));
-
-		return m_map[oshd];
-	}
-	void erase(OS_HANDLE oshd)
-	{
-		std::unique_lock<std::mutex> lk(m_mutex);
-		unsigned long v = (unsigned long)oshd;
-		if (v >= 0 && v < m_map_fast_size) {
-			m_map_fast[v] = NULL;
-			return;
-		}
-		auto it = m_map.find(oshd);
-		if (it != m_map.end())
-			m_map.erase(it);
-	}
-
-#ifdef WIN32
-	OS_HANDLE						m_h_io_compl_port;
-#else
-	//Linux
-	static const int                m_maxEpollEvents = 100;
-	static const int 				m_epollSize = 1000;
-	int								m_epollFd;
-#endif
-};
-
-ipc_io_service::Ptr ipc_io_service::create(const char* type)
-{
-	return ipc_io_service::Ptr(new ipc_io_service_impl());
-}
-
-ipc_io_service_impl::ipc_io_service_impl() :
-	m_map_fast{}
-{
-#ifdef WIN32
-	m_h_io_compl_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-	if (m_h_io_compl_port == NULL) 
-		THROW_SYSTEM_ERROR("ipc_io_service ctor: CreateIoCompletionPort failed.", GetLastError());
-#else
-	m_epollFd = epoll_create(m_epollSize);
-	if (m_epollFd < 0)
-		THROW_SYSTEM_ERROR("ipc_io_service ctor: epoll_create failed.", errno);
-#endif
-}
-
-ipc_io_service_impl::~ipc_io_service_impl()
-{
-	stop();
-#ifdef WIN32
-	CloseHandle(m_h_io_compl_port);
-#else
-	close(m_epollFd);
-#endif
-}
-
-void ipc_io_service_impl::stop()
-{
-#ifdef WIN32
-	m_exit.store(true);
-#else
-	m_exit.store(true);
-#endif
-}
-
-void ipc_io_service_impl::associate(ipc_connection * pconn)
-{
-	assert(pconn != NULL);
-
-	OS_HANDLE oshd = pconn->native_handle();
-
-	//simply reject nonsense input
-	if (oshd == INVALID_OS_HANDLE) return;
-
-	ipc_connection* p_conn = get(oshd);
-
-	if (p_conn == NULL) {
-#ifdef WIN32
-		//first time association: register into IO completion port system.
-		//we use the handle as completion key directly to be more compatible with linux/epoll
-		//though this is not the best solution
-		if (NULL == CreateIoCompletionPort(oshd, m_h_io_compl_port, (ULONG_PTR)oshd, 0))
-			THROW_SYSTEM_ERROR("associate() CreateIoCompletionPort failed.", GetLastError());
-#else
-		//linux, just add the fd into epoll
-		struct epoll_event event;
-
-		// we choose level-trigger mode, so blocking socket is enough.
-		//
-		// if we use edge-trigger mode, then we need to drain all available data in cache
-		// using non-blocking socket on each epoll-event, and this can bring some difficulty
-		// to application parser implementation
-		//
-		event.events = EPOLLIN | EPOLLRDHUP;
-		event.data.fd = pconn->native_handle();
-		if(-1 == epoll_ctl(m_epollFd, EPOLL_CTL_ADD, pconn->native_handle(), &event))
-			THROW_SYSTEM_ERROR("associate() epoll_ctl failed.", errno);
-#endif
-	}
-	else {
-		//do we need remove previous fd?
-	}
-
-	//internal association is mutable (although CreateIoCompletionPort can be down only once)
-	get(oshd) = pconn;
-}
-
-void ipc_io_service_impl::unassociate(ipc_connection * pconn)
-{
-	assert(pconn != NULL);
-	OS_HANDLE oshd = pconn->native_handle();
-
-	//simply reject nonsense input
-	if (oshd == INVALID_OS_HANDLE) return;
-
-#ifdef WIN32
-	//no way to un-associate unless we close the file handle
-#else
-	epoll_ctl(m_epollFd, EPOLL_CTL_DEL, pconn->native_handle(), NULL);
-#endif
-
-	//remove from cache
-	erase(oshd);
-}
-
-OS_HANDLE ipc_io_service_impl::native_handle(void)
-{
-#ifdef WIN32
-	return m_h_io_compl_port;
-#else
-	return m_epollFd;
-#endif
-}
-
-
-
-void ipc_io_service_impl::run()
-{
-#ifdef WIN32
-		m_exit.store(false);
-		//this thread will exit when m_exit is set
-		// or the CompletionPort is closed
-		while (!m_exit.load())
-		{
-			// the I/O completion port will post event on each low-level packet arrival
-			// which means the actuall NumberOfBytes still may less than required.
-			//
-			// but most time it is of the same size as sender's write buffer length
-			//
-			DWORD NumberOfBytes;
-			ULONG_PTR CompletionKey;
-			LPOVERLAPPED  lpOverlapped;
-			BOOL bSuccess = GetQueuedCompletionStatus(m_h_io_compl_port,
-				&NumberOfBytes,
-				&CompletionKey,
-				&lpOverlapped,
-				m_epollTimeout);
-
-			//Only GetLastError() on failure
-			DWORD dwErr = bSuccess ? 0 : GetLastError();
-
-			if (!bSuccess && ERROR_ABANDONED_WAIT_0 == dwErr)
-				break;
-
-			//Success
-			if (lpOverlapped == NULL) {
-				continue;
-			}
-
-			if (0) {
-				std::error_code ec(dwErr, std::system_category());
-				printf(">>>> %s GetQueuedCompletionStatus() returns bSuccess=%d, NumberOfBytes=%d, lpOverlapped=%p GetLastError=%d %s\n", __FUNCTION__,
-					bSuccess, NumberOfBytes, lpOverlapped, dwErr, ec.message().c_str());
-			}
-
-			if (lpOverlapped->hEvent) {
-				//a sync operation, skip callback
-				continue;
-			}
-
-			//lpOverlapped  is not null
-			// CompletionKey is the file handle
-			// we don't need a map because this Key is the Callback
-			OS_HANDLE oshd = static_cast<OS_HANDLE>((void*)CompletionKey);
-
-			ipc_connection * pconn = get(oshd);
-			assert(pconn);
-
-			//do not let exception from one connection terminate whole service thread!
-			try {
-				pconn->notify(dwErr, NumberOfBytes, lpOverlapped);
-			}
-			catch (std::exception & e) {
-				std::cerr << std::endl << "Exception in " __FUNCTION__ ": " << e.what() << std::endl;
-			}
-			catch (...) {
-				std::cerr << std::endl << "Exception in " __FUNCTION__ ": " << "Unknown" << std::endl;
-			}
-		}
-#else
-        /* Block SIGPIPE signal because remote peer may exit abnormally*/
-        sigset_t set;
-        sigemptyset(&set);
-        sigaddset(&set, SIGPIPE);
-        int s = pthread_sigmask(SIG_BLOCK, &set, NULL);
-        if (s != 0)
-        	THROW_SYSTEM_ERROR("pthread_sigmask failed", s);
-
-		m_exit.store(false);
-		//this thread will exit when m_exit is set
-		// or the CompletionPort is closed
-		while (!m_exit.load())
-		{
-			struct epoll_event events[m_maxEpollEvents];
-			int numEvents = epoll_wait(m_epollFd, events, m_maxEpollEvents, m_epollTimeout);
-			for (int i = 0; i < numEvents; i++)
-			{
-				int fd = events[i].data.fd;
-
-				ipc_connection * pconn = get(fd);
-				assert(pconn);
-				//do not let exception from one connection terminate whole service thread!
-				try {
-					pconn->notify(0, 0, events[i].events);
-				}
-				catch (std::exception & e) {
-					std::cerr << std::endl << "Exception in " << __FUNCTION__ << ": " << e.what() << std::endl;
-				}
-				catch (...) {
-					std::cerr << std::endl << "Exception in " << __FUNCTION__ << ": " << "Unknown" << std::endl;
-				}
-			}
-		}
-#endif
-}
-#endif
-//==========================================================================================================================
 //connection imeplmentation
 
 #ifdef WIN32
 
-// this class is an extention to fd/handle
-// on Windows, scheduler can locate it through CompletionKey.
-// on Linux, this needs derived from fd.
-//           https://stackoverflow.com/questions/8175746/is-there-any-way-to-associate-a-file-descriptor-with-user-defined-data
-class ipc_connection_win_namedpipe : public ipc_connection
-{
-public:
-	ipc_connection_win_namedpipe(ipc_io_service & service, const std::string & servername);
-	~ipc_connection_win_namedpipe();
-	virtual void notify(int error_code, int transferred_cnt, uintptr_t hint);
 
-	virtual OS_HANDLE native_handle() { return m_oshd; }
-
-	//blocking/sync version(based on async version)
-	virtual void read(void * pbuff, const int len, int *lp_cnt);
-	virtual void write(void * pbuff, const int len);
-
-	//can be used on duplicate fd(file descriptor) on Linux or File Handle on Windows
-	virtual void read(OS_HANDLE &oshd);
-	virtual void write(OS_HANDLE oshd);
-
-	//client(blocking is acceptable because usually its short latency)
-	virtual int connect(const std::string & dest);
-	virtual int listen(void);
-	virtual void close(void);
-
-protected:
-
-private:
-	ipc_connection_win_namedpipe(ipc_io_service & service, HANDLE handle);
-
-	void wait_for_connection(void);
-	void trigger_async_cache_read(void);
-
-	HANDLE					m_oshd;
-
-	// <0 means no cached byte0
-	// >0 means 1 byte is cached and should be filled to user's buffer first
-	unsigned char			m_cache_byte0;
-	bool					m_cache_empty;
-	OVERLAPPED				m_cache_overlapped;
-	OVERLAPPED				m_error_overlapped;
-	OVERLAPPED				m_waitconn_overlapped;
-	OVERLAPPED				m_sync_overlapped;
-
-	std::string				m_name;		//IPC name
-};
-
-ipc_connection_win_namedpipe::ipc_connection_win_namedpipe(ipc_io_service &service, const std::string & servername) :
-	ipc_connection(service), 
+ipc_connection_win_namedpipe::ipc_connection_win_namedpipe(ipc_connection_poller * p) :
+	ipc_connection(p), 
 	m_cache_byte0(0), 
 	m_cache_empty(true), 
 	m_cache_overlapped{}, 
 	m_error_overlapped{}, 
 	m_sync_overlapped{},
 	m_waitconn_overlapped{},
-	m_name(servername)
+	m_name(),
+	m_state(state::EMPTY)
 {
 	m_sync_overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 	if (NULL == m_sync_overlapped.hEvent)
 		THROW_SYSTEM_ERROR("ipc_connection_win_namedpipe ctor CreateEvent() failed.", GetLastError());
 }
 
-ipc_connection_win_namedpipe::ipc_connection_win_namedpipe(ipc_io_service & service, HANDLE handle) :
-	ipc_connection(service), 
-	m_cache_byte0(0), 
-	m_cache_empty(true), 
-	m_cache_overlapped{},
-	m_error_overlapped{},
-	m_sync_overlapped{}, 
-	m_waitconn_overlapped{},
-	m_oshd(handle), 
-	m_name("")
-{
-	m_sync_overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-	if (NULL == m_sync_overlapped.hEvent)
-		THROW_SYSTEM_ERROR("ipc_connection_win_namedpipe ctor CreateEvent() failed.", GetLastError());
-	m_service.associate(this);	//change association as well
-}
 ipc_connection_win_namedpipe::~ipc_connection_win_namedpipe()
 {
 	CloseHandle(m_sync_overlapped.hEvent);
 	close();
 }
 
-void ipc_connection_win_namedpipe::notify(int error_code, int transferred_cnt, uintptr_t hint)
+void ipc_connection_win_namedpipe::notify(int error_code, int transferred_cnt, uintptr_t hint, ipc_poll_event * p_evt)
 {
 	OVERLAPPED * poverlapped = (OVERLAPPED *)hint;
 
-	const char * pevt = "";
-	if (poverlapped == &m_cache_overlapped) pevt = "cache";
-	if (poverlapped == &m_error_overlapped) pevt = "error";
-	if (poverlapped == &m_waitconn_overlapped) pevt = "accept";
-
-	if (poverlapped == &m_sync_overlapped) return;
-
-	if (poverlapped == &m_cache_overlapped ||
-		poverlapped == &m_error_overlapped) {
-
-		// scopeguard will always trigger next async read (even in case of exception)
-		auto  guard_asyn_cache_read = scopeGuard([this]() {trigger_async_cache_read(); });
-
-		std::error_code ec2;
-		if (poverlapped == &m_error_overlapped)
-			ec2 = std::error_code(m_error_overlapped.Offset, std::system_category());
-		else {
-			ec2 = std::error_code(error_code, std::system_category()); ;
+	if (poverlapped == &m_error_overlapped)
+	{
+		int ec = m_error_overlapped.Offset;
+		if (ec == ERROR_BROKEN_PIPE) {
+			p_evt->e = ipc_poll_event::event::POLLHUP;
+			p_evt->pconn = this;
 		}
-
-		if (transferred_cnt == 1) {
+		else {
+			assert(0);
+		}
+	}
+	else if (poverlapped == &m_cache_overlapped)
+	{
+		if (error_code == 0) {
+			assert(transferred_cnt == 1);
 			//fprintf(stderr, ">>>>>>>>>> m_cache_byte0=%c from [%s]  \n", m_cache_byte0, pevt);
 			m_cache_empty = false;
+			p_evt->e = ipc_poll_event::event::POLLIN;
+			p_evt->pconn = this;
+			m_poller->queue_prewait_callback([this]() {
+				// prewait_callback will happen before next poller wait() cycle , 
+				// user of the connection is supposed to have done all read with it 
+				// and will suspending ifself until next byte arrives. 
+				// so that is the point we will trigger async 1byte cache read operation.
+
+				//trigger_async_cache_read is designed to not throw or fail, it will post error
+				//to completion IO port instead.
+				this->trigger_async_cache_read();
+			});
 		}
-
-		assert(transferred_cnt == 1 || transferred_cnt == 0);
-
-		//cache byte received, 
-		if (on_close && ec2.value() == ERROR_BROKEN_PIPE) {
-			guard_asyn_cache_read.dismiss();
-			on_close(this);
+		else if (error_code == ERROR_BROKEN_PIPE) {
+			p_evt->e = ipc_poll_event::event::POLLHUP;
+			p_evt->pconn = this;
 		}
-		else
-		{
-			bool b_new_data_arrived = !m_cache_empty;
-
-			if (on_read)
-				on_read(this, ec2, 0);
-
-			//user must atleast read one byte inside the callback
-			if (b_new_data_arrived && !m_cache_empty) {
-				//no one clear the cache!
-				guard_asyn_cache_read.dismiss();
-				assert(0);
-			}
+		else {
+			assert(0);
 		}
 	}
-	else if (poverlapped == &m_waitconn_overlapped) {
-		//accept
-		if (on_accept) {
-			//on windows, the namedpipe handle that accepted the connection
-			//will serve the connection directly.
-			//
-			//In socket, the listening socket is keep listenning, a new socket 
-			//will be returned for client connection purpose.
-			//
-			//to make them consistent, we follow the socket way, return client connection
-			//
-
-			//transffer our handle to new wrapper(this is possible, thanks to the mapping that io_service supported)
-			ipc_connection_win_namedpipe * pconn = new ipc_connection_win_namedpipe(get_service(), native_handle());
-
-			auto guard_asyn_cache_read = scopeGuard([pconn]() {pconn->trigger_async_cache_read(); });
-
-			listen();//create a new instance of the pipe
-
-					 //user will setup callbacks inside on_accept()
-			on_accept(pconn);
-
-			wait_for_connection();
-		}
-	}
-	else
-		return;
-}
-
-void ipc_connection_win_namedpipe::wait_for_connection(void)
-{
-	assert_line(native_handle() != INVALID_OS_HANDLE);
-
-	BOOL bRet = ConnectNamedPipe(native_handle(), &m_waitconn_overlapped);
-	if (bRet) {
-		//connection success, no IO pending, make sure on_accept is called within right thread
-		//according to behaviour of ReadFile, completion IO event should be trigered automatically
-
-		//PostQueuedCompletionStatus(get_service().native_handle(), 1, (ULONG_PTR)native_handle(), &m_waitconn_overlapped);
-	}
-	else {
-		DWORD dwErr = GetLastError();
-		if (dwErr == ERROR_PIPE_CONNECTED)
-			PostQueuedCompletionStatus(get_service().native_handle(), 1, (ULONG_PTR)native_handle(), &m_waitconn_overlapped);
-
-		else if (dwErr != ERROR_IO_PENDING && dwErr != ERROR_SUCCESS) {
-			THROW_SYSTEM_ERROR("wait_for_connection ConnectNamedPipe failed.", dwErr);
-			//m_error_overlapped.Offset = dwErr;
-			//PostQueuedCompletionStatus(get_service().native_handle(), 1, (ULONG_PTR)native_handle(), &m_error_overlapped);
-		}
+	else if (poverlapped == &m_waitconn_overlapped)
+	{
+		//we do not invent another event because our operation mimics linux socket model
+		//and the connection is in LISTEN state, so POLLIN can only means new connection 
+		//is arrived.
+		p_evt->e = ipc_poll_event::event::POLLIN;	
+		p_evt->pconn = this;
 	}
 }
+
+
 
 //blocking/sync version(based on async version)
-void ipc_connection_win_namedpipe::read(void * pvbuff, const int len, int *lp_cnt)
+EResult ipc_connection_win_namedpipe::read(void * pvbuff, const int len, int *lp_cnt)
 {
-	assert_line(native_handle() != INVALID_OS_HANDLE);
+	if (m_oshd == INVALID_OS_HANDLE || pvbuff == nullptr || len == 0)
+		return anERROR(-1) << "read() invalid argument m_oshd=" << m_oshd << " pvbuff=" << pvbuff << " len=" << len;
 
 	//m_ior_in.setup((char*)pbuff, len, IOTYPE_IN, true);
 	unsigned char * pbuff = (unsigned char *)pvbuff;
@@ -751,7 +376,7 @@ void ipc_connection_win_namedpipe::read(void * pvbuff, const int len, int *lp_cn
 		*lp_cnt = cnt;
 
 		//some mode, return as fast as we can
-		if (bytes_avail == 0) return;
+		if (bytes_avail == 0) return 0;
 	}
 
 	while (cnt < size) {
@@ -777,14 +402,14 @@ void ipc_connection_win_namedpipe::read(void * pvbuff, const int len, int *lp_cn
 				}else {
 					dwErr = GetLastError();
 					if (dwErr != ERROR_SUCCESS) 
-						THROW_SYSTEM_ERROR("read GetOverlappedResult() failed.", dwErr);
+						return anERROR(-2, dwErr) << "read GetOverlappedResult() failed.";
 					//cnt += NumberOfBytesTransferred;	//do we need it? little confusing
 					//error_code = dwErr;
 				}
 				ResetEvent(m_sync_overlapped.hEvent);
 			}
 			else  if (dwErr != ERROR_SUCCESS) {
-				THROW_SYSTEM_ERROR("read ReadFile() failed.", dwErr);
+				return anERROR(-3, dwErr) << "read ReadFile() failed.";
 			}
 		}
 
@@ -794,13 +419,13 @@ void ipc_connection_win_namedpipe::read(void * pvbuff, const int len, int *lp_cn
 		}
 	};
 	//fprintf(stderr, "<");
-	
-	return;
+	return 0;
 }
-void ipc_connection_win_namedpipe::write(void * pvbuff, const int len)
+EResult ipc_connection_win_namedpipe::write(void * pvbuff, const int len)
 {
-	assert_line(native_handle() != INVALID_OS_HANDLE);
-
+	if (m_oshd == INVALID_OS_HANDLE || pvbuff == nullptr || len == 0)
+		return anERROR(-1) << "write() invalid argument m_oshd=" << m_oshd << " pvbuff=" << pvbuff << " len=" << len;
+	
 	unsigned char * pbuff = (unsigned char *)pvbuff;
 	int size = len;
 	int cnt = 0;
@@ -821,18 +446,18 @@ void ipc_connection_win_namedpipe::write(void * pvbuff, const int len)
 				else {
 					dwErr = GetLastError();
 					if (dwErr != ERROR_SUCCESS)
-						THROW_SYSTEM_ERROR("write GetOverlappedResult() failed.", dwErr);
+						return anERROR(-2, dwErr) << "write GetOverlappedResult() failed.";
 					//cnt += NumberOfBytesTransferred;	//do we need it? little confusing
 				}
 				ResetEvent(m_sync_overlapped.hEvent);
 			}
 			else if (dwErr != ERROR_SUCCESS) {
-				THROW_SYSTEM_ERROR("write WriteFile() failed.", dwErr);
+				return anERROR(-3, dwErr) << "write WriteFile() failed.";
 			}
 		}
 	};
 
-	return;
+	return 0;
 }
 //can be used on duplicate fd(file descriptor) on Linux or File Handle on Windows
 void ipc_connection_win_namedpipe::read(OS_HANDLE &hDstHandle)
@@ -892,14 +517,63 @@ void ipc_connection_win_namedpipe::trigger_async_cache_read(void)
 			//std::error_code ec(dwErr, std::system_category());
 			//fprintf(stderr, "trigger_async_cache_read() returns %d:%s\n", dwErr, ec.message().c_str());
 			m_error_overlapped.Offset = dwErr;
-			PostQueuedCompletionStatus(get_service().native_handle(), 0, (ULONG_PTR)native_handle(), &m_error_overlapped);
+			PostQueuedCompletionStatus(m_poller->native_handle(), 0, (ULONG_PTR)native_handle(), &m_error_overlapped);
 		}
 	}
 }
 
-int ipc_connection_win_namedpipe::connect(const std::string & dest)
+EResult ipc_connection_win_namedpipe::wait_for_connection(void)
 {
-	HANDLE oshd = CreateFile(dest.c_str(),   // pipe name 
+	assert_line(native_handle() != INVALID_OS_HANDLE);
+
+	BOOL bRet = ConnectNamedPipe(native_handle(), &m_waitconn_overlapped);
+	if (bRet) {
+		//connection success, no IO pending, make sure on_accept is called within right thread
+		//according to behaviour of ReadFile, completion IO event should be trigered automatically
+		//so we don't need do it manually
+
+		//PostQueuedCompletionStatus(get_service().native_handle(), 1, (ULONG_PTR)native_handle(), &m_waitconn_overlapped);
+	}
+	else {
+		DWORD dwErr = GetLastError();
+		if (dwErr == ERROR_PIPE_CONNECTED)
+			PostQueuedCompletionStatus(m_poller->native_handle(), 1, (ULONG_PTR)native_handle(), &m_waitconn_overlapped);
+
+		else if (dwErr != ERROR_IO_PENDING && dwErr != ERROR_SUCCESS) {
+			return anERROR(-1, dwErr) << "wait_for_connection ConnectNamedPipe failed.";
+			//m_error_overlapped.Offset = dwErr;
+			//PostQueuedCompletionStatus(gm_poller->native_handle(), 1, (ULONG_PTR)native_handle(), &m_error_overlapped);
+		}
+	}
+	return 0;
+}
+
+std::ostream& operator<<(std::ostream& s, const ipc_connection_win_namedpipe::state & d)
+{
+	// Read the image data from the stream into the image
+	switch (d) {
+	case ipc_connection_win_namedpipe::state::CONN:
+		s << "CONN";
+		break;
+	case ipc_connection_win_namedpipe::state::DISCONN:
+		s << "DISCONN";
+		break;
+	case ipc_connection_win_namedpipe::state::EMPTY:
+		s << "EMPTY";
+		break;
+	case ipc_connection_win_namedpipe::state::LISTEN:
+		s << "LISTEN";
+		break;
+	}
+	return s;
+}
+
+EResult ipc_connection_win_namedpipe::connect(const std::string & serverName)
+{
+	if (m_state != state::EMPTY)
+		return anERROR(-1) << "m_state=" << m_state << " when connect";
+
+	HANDLE oshd = CreateFile(serverName.c_str(),   // pipe name 
 		GENERIC_READ |  // read and write access 
 		GENERIC_WRITE,
 		0,              // no sharing 
@@ -907,21 +581,29 @@ int ipc_connection_win_namedpipe::connect(const std::string & dest)
 		OPEN_EXISTING,  // opens existing pipe 
 		FILE_FLAG_OVERLAPPED,              // default attributes 
 		NULL);          // no template file 
+
 	if (oshd == INVALID_HANDLE_VALUE)
-		THROW_SYSTEM_ERROR("connect() CreateFile failed.", GetLastError());
+		return anERROR(-2, ::GetLastError()) << "connect() CreateFile failed.";
 
 	m_oshd = oshd;
-	m_service.associate(this);
+	m_state = state::CONN;
+	m_poller->add(this);
 	trigger_async_cache_read();
 	return 0;
 }
 
-int ipc_connection_win_namedpipe::listen(void)
+//listen/accept is triky on Windows, any successful connection will trigger
+//an completion event, and the listening handle will becomes the connected
+//handle, so we need switch handle to simulate socket
+EResult ipc_connection_win_namedpipe::listen(const std::string & serverName)
 {
+	if (m_state != state::EMPTY)
+		return anERROR(-1) << "m_state=" << m_state << " when listen";
+
 	//server
 #define PIPE_TIMEOUT 5000
 #define BUFSIZE 4096
-	HANDLE oshd = CreateNamedPipe(m_name.c_str(),            // pipe name 
+	HANDLE oshd = CreateNamedPipe(serverName.c_str(),            // pipe name 
 		PIPE_ACCESS_DUPLEX |     // read/write access 
 		FILE_FLAG_OVERLAPPED,    // overlapped mode 
 		PIPE_TYPE_BYTE |      // byte-type pipe 
@@ -933,13 +615,55 @@ int ipc_connection_win_namedpipe::listen(void)
 		PIPE_TIMEOUT,            // client time-out 
 		NULL);                   // default security attributes 
 	if (oshd == INVALID_HANDLE_VALUE) 
-		THROW_SYSTEM_ERROR("listen() CreateNamedPipe failed.", GetLastError());
+		return anERROR(-2, ::GetLastError()) << "listen() CreateNamedPipe failed.";
 
 	// only for ipc server 
 	// which do not do IO at all, only async_accept() will be called
 	m_oshd = oshd;
-	m_service.associate(this);
-	wait_for_connection();
+	m_name = serverName;
+	m_state = state::LISTEN;
+	m_poller->add(this);
+
+	//start the ConnectNamedPipe ASYNC call 
+	EResult err = wait_for_connection();
+	if (err)
+		return anERROR(-3, err.error_sys()) << "wait_for_connection failed.";
+
+	return 0;
+}
+
+//when accept is called, the listener is actually already connected
+//so we just swap the underlying HANDLE with the listener and tell 
+//listener to listen again
+EResult ipc_connection_win_namedpipe::accept(ipc_connection * listener)
+{
+	ipc_connection_win_namedpipe * plis = dynamic_cast<ipc_connection_win_namedpipe *>(listener);
+
+	if(!plis)
+		return anERROR(-1) << "listener is not of type ipc_connection_win_namedpipe";
+
+	if (m_state != state::EMPTY)
+		return anERROR(-2) << "m_state=" << m_state << " when accept";
+
+	if (plis->m_state != state::LISTEN)
+		return anERROR(-3) << "listener->m_state=" << plis->m_state << " when accept";
+
+	//stole from listener
+	m_oshd = plis->m_oshd;
+	m_state = state::CONN;
+	m_name = plis->m_name;
+	m_poller->add(this);		//change the HANDLE<->object mapping
+
+	trigger_async_cache_read();	//trigger ASYNC 1byte cache read for connected 
+
+	//put listener to listen again
+	plis->m_oshd = NULL;
+	plis->m_state = state::EMPTY;
+
+	EResult err;
+	err = plis->listen(plis->m_name);
+	if (err) 
+		return anERROR(-4, err.error_sys()) << "re-listen on " << plis->m_name << " failed";
 
 	return 0;
 }
@@ -948,10 +672,11 @@ void ipc_connection_win_namedpipe::close(void)
 {
 	if (m_oshd != INVALID_OS_HANDLE) {
 		//close it
-		m_service.unassociate(this);
+		m_poller->del(this);
 		CloseHandle(m_oshd);
 		m_oshd = INVALID_OS_HANDLE;
 	}
+	m_state = state::EMPTY;
 }
 #endif
 
@@ -1012,12 +737,12 @@ void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, uintp
 
 	//printf(">>>>>>>>>>>>>>> notify : %s,%s\n",hint&EPOLLIN?"EPOLLIN":"",hint&EPOLLRDHUP?"EPOLLRDHUP":"");
 	if ((hint & EPOLLRDHUP) || (hint & EPOLLHUP)) {
-		pevt->e = ipc_poll_event::event::HUP;
+		pevt->e = ipc_poll_event::event::POLLHUP;
 		pevt->pconn = this;
 	}
 	else if (hint & EPOLLIN) {
 		//new data arrived
-		pevt->e = ipc_poll_event::event::IN;
+		pevt->e = ipc_poll_event::event::POLLIN;
 		pevt->pconn = this;
 		//std::error_code ec(error_code, std::system_category());
 	}
