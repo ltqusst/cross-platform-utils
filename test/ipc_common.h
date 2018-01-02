@@ -22,5 +22,4 @@ using ipc_conn = cross::ipc_connection_win_namedpipe;
 #endif
 
 
-
 #endif /* TEST_IPC_COMMON_H_ */

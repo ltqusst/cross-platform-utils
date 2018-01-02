@@ -95,6 +95,17 @@ struct ipc_poll_event
 	ipc_connection	*						pconn = nullptr;
 };
 
+// use this for temporarily block out the poller form report any event regarding this connection
+// we follow the RAll philosophy in the design.
+class ipc_connection_poll_blocker
+{
+	ipc_connection * m_pc;
+	ipc_connection_poll_blocker(ipc_connection * pc); //lock the connection to not trigger poller
+	friend class ipc_connection;
+public:
+	~ipc_connection_poll_blocker(); //unlock the connection so poller will function again
+};
+
 class ipc_connection : public NonCopyable
 {
 public:
@@ -127,7 +138,18 @@ public:
 
 	friend class ipc_connection_poller;
 
+	//this is a easier interface, user can do "auto blocker = pconn->create_poll_blocker();" 
+	//to block poller from being triggered.
+	std::shared_ptr<ipc_connection_poll_blocker> make_blocker_POLLIN() {
+		this->block_poller(); //TODO: handle possible ERROR here
+		return std::shared_ptr<ipc_connection_poll_blocker>(new ipc_connection_poll_blocker(this));
+	}
 protected:
+
+	//for ipc_connection_poll_blocker to call
+	friend class ipc_connection_poll_blocker;
+	virtual EResult block_poller() { return 0; };
+	virtual void unblock_poller() {};
 
 	//on Windows, notify means one IO request is completed or error occured
 	//on Linux, notify means one IO request type is ready to issue without blocking
@@ -143,12 +165,7 @@ class ipc_connection_poller: public NonCopyable
 {
 	//a general mapping facility
 	fast_mapper<OS_HANDLE>	m_mapper;
-
-	static const int        		m_epollTimeout = 100;
-
-
-	std::queue < std::function<void()> > m_prewait_callbacks;
-
+	callback_queue<void()>		m_prewait_callbacks;
 #ifdef WIN32
 	OS_HANDLE						m_h_io_compl_port;
 #else
@@ -162,15 +179,14 @@ public:
 	~ipc_connection_poller();
 	void add(ipc_connection * pconn);
 	void del(ipc_connection * pconn);
-	EResult wait(ipc_poll_event * pevt);
+	EResult wait(ipc_poll_event * pevt, int timeout_ms = 100);
 
 	
 	//queue prewait callbacks helper function 
 	// make sure the callback do not throw exception or return error code
 	template<typename _Callable, typename... _Args>
 	void queue_prewait_callback(_Callable&& __f, _Args&&... __args){
-		std::function<void()> func = std::bind(std::forward<_Callable>(__f), std::forward<_Args>(__args)...);
-		m_prewait_callbacks.push(func);
+		m_prewait_callbacks.push(std::forward<_Callable>(__f), std::forward<_Args>(__args)...);
 	}
 
 	OS_HANDLE native_handle(void);
@@ -245,6 +261,8 @@ public:
 	virtual void close(void);
 
 protected:
+	virtual EResult block_poller() ;
+	virtual void unblock_poller() ;
 
 private:
 
@@ -263,6 +281,8 @@ private:
 	OVERLAPPED				m_error_overlapped;
 	OVERLAPPED				m_waitconn_overlapped;
 	OVERLAPPED				m_sync_overlapped;
+
+	bool					m_poller_blocked = false;
 
 	std::string				m_name;		//IPC name
 	enum class state { EMPTY = 0, LISTEN, CONN, DISCONN }	m_state;

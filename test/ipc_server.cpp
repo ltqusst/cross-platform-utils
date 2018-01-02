@@ -23,7 +23,7 @@ public:
 	int64_t													tst1_ms0;
 	std::chrono::time_point<std::chrono::steady_clock> 		tst1_tim1;
 
-	void on_tst1(){
+	cross::EResult on_tst1(){
 		char buff_rx[1024];
 		int len = sizeof(buff_rx);
 
@@ -36,9 +36,7 @@ public:
 
 		auto err = read(buff_rx, len);
 		if (err) {
-			std::cerr << "on_tst1() read failed:" << std::endl;
-			std::cerr << err.message() << std::endl;
-			return;
+			return anERROR(-1) << "on_tst1() read failed" << err;
 		}
 
 		for (int k = 0; k < len && tst1_id < tst1_count; k++, tst1_id++) {
@@ -62,8 +60,65 @@ public:
 			tst1_count = 0;
 			std::cerr << " Done\n" << std::endl;
 		}
+		return 0;
 	}
 
+	class echo {
+		int				eh_len		= 0;
+		int				eh_progress = 0;
+		char			eh_buff[1024];
+	public:
+		bool is_active(){	return eh_len > 0;	}
+		int size() { return eh_len; }
+		cross::EResult start(server_conn * pconn)
+		{
+			//init
+			int len = 0;
+
+			eh_len = 0;
+			eh_progress = 0;
+
+			if (pconn->read(&len, sizeof(eh_len))) 
+				return anERROR(-1) << "read echo length failed";
+			
+			if (len > sizeof(eh_buff))
+				return anERROR(-1) << "eh_buff[" << sizeof(eh_buff) << "] is not big enough for echo of size=" << len;
+			
+			eh_len = len;	//assign here is fail-safe
+			std::cout << "Client [" << pconn->native_handle() << "] echo on " << size() << " bytes:" << std::endl;
+
+			return 0;
+		}
+		cross::EResult on_echo(server_conn * pconn)
+		{
+			cross::EResult err;
+			int cnt = 0;
+
+			//make sure in any case
+			auto g1 = cross::make_scopeGuard([&] {eh_len = 0; });
+
+			//non-blocking version
+			err = pconn->read(eh_buff + eh_progress, eh_len - eh_progress, &cnt);
+			if (err) return err;
+
+			eh_progress += cnt;
+
+			if (eh_progress > eh_len)
+				return anERROR(-1) << "eh_progress=" << eh_progress << " is bigger than expected " << eh_len;
+
+			if (eh_progress < eh_len){
+				g1.dismiss();
+			}
+			else
+			{
+				//echo back
+				err = pconn->write(eh_buff, eh_len);
+				if (err) return err;
+				std::cout << "Client [" << pconn->native_handle() << "] echo-ed back." << std::endl;
+			}
+			return 0;
+		}
+	} m_echo;
 
 	bool on_request(){
 		using namespace cross;
@@ -73,10 +128,20 @@ public:
 		int len = 0;
 
 		if(tst1_count > 0){
-			on_tst1();
+			err = on_tst1();
+			if (err) {
+				std::cerr << err.message() << std::endl;
+			}
 			return false;
 		}
 
+		if (m_echo.is_active()) {
+			err = m_echo.on_echo(this);
+			if (err) 
+				std::cerr << err.message() << std::endl;
+			return false;
+		}
+		
 		if(read(buff_rx, 4, &len))
 			return false;
 
@@ -93,6 +158,12 @@ public:
 			//tst1 test
 			return true;
 		}
+		if (len == 4 && strncmp(buff_rx, "echo", 4) == 0) {
+			err = m_echo.start(this);
+			if (err)
+				std::cerr << err.message() << std::endl;				
+			return false;
+		}
 
 		//async mode will return with 0 bytes if no other data in the pipe right now
 		int len2 = 0;
@@ -104,16 +175,20 @@ public:
 		//async_write(buff_tx, 10, std::bind(&ipc_server1::on_write, this, _1, _2));
 		std::cout << "Client [" << native_handle() << "] got " << len << " bytes:";
 
-		for (int i = 0; i < std::min<>(32, len); i++) {
-			printf("%c", buff_rx[i]);
-		}
+		for (int i = 0; i < len; i++)
+			if (i > 32) {
+				std::cout << "...";
+				break;
+			}else
+				std::cout << buff_rx[i];
+
+		std::cout << std::flush;
 
 		if(read(buff_rx, 1))
 			return false;
 
 		buff_rx[1] = 0;
-		printf(" And %s:", buff_rx);
-		printf("\n");
+		std::cout << " And " << buff_rx << std::endl;
 
 		string_copy(buff_tx, "GOT IT");
 		err = write(buff_tx, strlen(buff_tx));
@@ -169,9 +244,7 @@ static cross::EResult server(int argc, char * argv[])
 		if(evt.pconn == listener.get() && evt.e == ipc_poll_event::event::POLLIN){
 			//acceptor
 			server_conn * pconn = new server_conn(poller.get());
-
 			pconn->accept(listener.get());
-
 			//pconn is automatically added to poller
 			std::cout << "Client ["<< pconn->native_handle() << "] connected.\n";
 			continue;
@@ -207,15 +280,20 @@ static cross::EResult server(int argc, char * argv[])
 
 int main(int argc, char * argv[])
 {
-	//start server in backgound task
-	cross::EResult err = cross::daemonize();
+	//"-d" invoke from console/terminal but start daemon background
+	if (argc > 1 && strcmp(argv[1],"-d") == 0) {
+		//start server in backgound task
+		std::cout << "before: pid=" << cross::getPID() << std::endl;
 
-	if(err){
-		std::cout<<"error:" << err.message() << std::endl;
-		return err;
-	}else{
-		int pid = cross::getPID();
-		std::cout<<"daemon: pid=" << pid << std::endl;
+		cross::EResult err = cross::daemonize();
+
+		if (err) {
+			std::cout << "error:" << err.message() << std::endl;
+			return err;
+		}
+		else {
+			std::cout << "daemonized: pid=" << cross::getPID() << std::endl;
+		}
 	}
 
 	server(argc, argv);

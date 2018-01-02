@@ -257,16 +257,19 @@ public:
 		deref();
 	}
 
-	std::string message(void)
+	std::string message(void) const
 	{
 		//we took unix tradition, error>=0 is allowed as normal return value
 		if(m_pdetail && m_pdetail->m_err < 0){
 			std::stringstream ss;
-			ss << "error (" << m_pdetail->m_err << "): " << m_pdetail->m_ss.str();
+			ss << "error " << m_pdetail->m_err << " " << m_pdetail->m_ss.str();
 			//err_sys is only meaningful when err occurs
 			if(m_pdetail->m_err_sys){
 				std::error_code ec(m_pdetail->m_err_sys, std::system_category());
-				ss << ec.message() << " (" << m_pdetail->m_err_sys << ")";
+				std::string em = ec.message();
+				em.erase(std::remove(em.begin(), em.end(), '\r'), em.end());
+				em.erase(std::remove(em.begin(), em.end(), '\n'), em.end());
+				ss << " [" << m_pdetail->m_err_sys << " " << em << "]";
 			}
 			return ss.str();
 		}
@@ -310,41 +313,88 @@ public:
 		return *this;
 	}
 
+	//template specialization, add inner error
+	template<>
+	EResult& operator<<(const EResult& t)
+	{
+		EResult_DEBUG("**** operator<<(EResult&) ");
+
+		//only log error message on error construct
+		if (m_pdetail)
+			m_pdetail->m_ss << "\n." << t.message() ;	//one space indent
+		return *this;
+	}
 };
 
-#define anERROR(...) cross::EResult(__VA_ARGS__) <<__FILE__<<":"<<__LINE__ << "\t"
+#define anERROR(...) cross::EResult(__VA_ARGS__) <<__FILE__<<":"<<__LINE__ << "\n\t\t"
 
+
+//=========================================================================
+// callback_queue can be more versatile than a single callable (like TODO list, thread-safe)
+// 
+template <typename> class callback_queue;
+template<typename R, typename ...Args>
+class callback_queue<R(Args...)> {
+	std::queue < std::function<R(Args...)> >	m_queue;
+	std::mutex										m_mutex;
+public:
+	// __f the callable to be en-queued.
+	template<typename _Callable>
+	void push(_Callable&& __f) {
+		//when you need to store callable or pass it through function call
+		//use single template argument like push does, caller of this function is 
+		// free to choose use lambda or std::bind()
+
+		// orginal version call bind inside push, but since we support arg for callback, 
+		// the placeholder is more natrual in caller's code when they call bind themselves.
+		std::unique_lock<std::mutex> lk(m_mutex);
+
+		//construct the std::function object from of the callable
+		m_queue.emplace(std::forward<_Callable>(__f));	
+	}
+
+	bool empty(void) {
+		std::unique_lock<std::mutex> lk(m_mutex);
+		return m_queue.empty();
+	}
+
+	//pop first functor in queue and call it
+	R pop(Args... args) {
+		//we don't use Universal Referencing syntax here because the Args types are already 
+		//specified manually.
+		//Universal Referencing syntax is only necessary for automatic type deduction cases
+
+		//  type     | manually specify T | universal ref T |  return type of forward<T> is always T&&
+		// lvalue    |  string            |   string        |    string   &&                     (= string &&)
+		// lvalue ref|  string &          |   string &      |    string & &&  /string & &&       (= string &)
+		// rvalue ref|  string &&         |   string        |    string && && / string &&        (= string &&)
+
+		std::unique_lock<std::mutex> lk(m_mutex);
+
+		// note that std::forward works fine in both cases.
+		auto func = m_queue.front();
+		m_queue.pop();
+		return func(std::forward<Args>(args)...);
+	}
+
+	//drop first functor in queue w/o call it
+	void drop(void) {
+		m_queue.pop();
+	}
+};
 
 
 //====================================================
-static int getPID()
-{
-#ifdef linux
-	return getpid();
-#endif
 
-#ifdef WIN32
-	return ::GetCurrentProcessId();
-#endif
-}
+//get current process ID
+int getPID();
 
-static EResult daemonize(void)
-{
-#ifdef linux
-	int nochdir = 1;
-	int noclose = 1;
-	if(daemon(nochdir, noclose) < 0)
-	{
-		return anERROR(-1, errno) << "daemon() failed";
-	}
-#endif
+//make duplicate process with STD console/terminal detached
+//and run in background
+EResult daemonize(void);
 
-#ifdef WIN32
-#endif
-
-	return 0;
-}
-
+//execute specified command line in background
+EResult create_daemon(char* argv[]);
 
 }
 #endif

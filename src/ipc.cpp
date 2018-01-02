@@ -57,8 +57,6 @@
 
 namespace cross{
 
-
-
 //poller is better than service because more flexible and no callback
 ipc_connection_poller::ipc_connection_poller(){
 #ifdef WIN32
@@ -149,16 +147,14 @@ void ipc_connection_poller::del(ipc_connection * pconn){
 }
 
 
-EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
+EResult ipc_connection_poller::wait(ipc_poll_event * pevt, int timeout_ms){
 
 	if(pevt == nullptr)
 		return anERROR(-1) << "pevt is null";
 
 	//empty the callbacks(errors will be silient)
 	while (!m_prewait_callbacks.empty()) {
-		std::function<void()> func = m_prewait_callbacks.front();
 		m_prewait_callbacks.pop();
-		func();
 	}
 
 #ifdef WIN32
@@ -176,7 +172,7 @@ EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
 			&NumberOfBytes,
 			&CompletionKey,
 			&lpOverlapped,
-			m_epollTimeout);
+			timeout_ms);
 
 		DWORD dwErr = bSuccess ? 0 : (::GetLastError());
 
@@ -204,8 +200,10 @@ EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
 		OS_HANDLE oshd = static_cast<OS_HANDLE>((void*)CompletionKey);
 
 		ipc_connection * pconn = m_mapper.get(oshd);
-
-		assert_line(pconn);
+		if (!pconn) {
+			return anERROR(-5) << "no connection object for handle " << oshd;
+		}
+		//assert_line(pconn);
 		//do not let exception from one connection terminate whole service thread!
 		try {
 			pconn->notify(dwErr, NumberOfBytes, (uintptr_t)lpOverlapped, pevt);
@@ -237,7 +235,7 @@ EResult ipc_connection_poller::wait(ipc_poll_event * pevt){
 		});
 
 		struct epoll_event event;
-		int numEvents = epoll_wait(m_epollFd, &event, 1, m_epollTimeout);
+		int numEvents = epoll_wait(m_epollFd, &event, 1, timeout_ms);
 
 		if(numEvents < 0)
 			return anERROR(-3, errno) << "epoll_wait() error.";
@@ -280,6 +278,7 @@ ipc_connection_win_namedpipe::ipc_connection_win_namedpipe(ipc_connection_poller
 	m_sync_overlapped{},
 	m_waitconn_overlapped{},
 	m_name(),
+	m_oshd(INVALID_OS_HANDLE),
 	m_state(state::EMPTY)
 {
 	m_sync_overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
@@ -292,6 +291,7 @@ ipc_connection_win_namedpipe::~ipc_connection_win_namedpipe()
 	CloseHandle(m_sync_overlapped.hEvent);
 	close();
 }
+
 
 void ipc_connection_win_namedpipe::notify(int error_code, int transferred_cnt, uintptr_t hint, ipc_poll_event * p_evt)
 {
@@ -313,25 +313,47 @@ void ipc_connection_win_namedpipe::notify(int error_code, int transferred_cnt, u
 		if (error_code == 0) {
 			assert(transferred_cnt == 1);
 			//fprintf(stderr, ">>>>>>>>>> m_cache_byte0=%c from [%s]  \n", m_cache_byte0, pevt);
-			m_cache_empty = false;
-			p_evt->e = ipc_poll_event::event::POLLIN;
-			p_evt->pconn = this;
-			m_poller->queue_prewait_callback([this]() {
-				// prewait_callback will happen before next poller wait() cycle , 
-				// user of the connection is supposed to have done all read with it 
-				// and will suspending ifself until next byte arrives. 
-				// so that is the point we will trigger async 1byte cache read operation.
 
-				//trigger_async_cache_read is designed to not throw or fail, it will post error
-				//to completion IO port instead.
-				this->trigger_async_cache_read();
-			});
+			//a connection with poller blocked will not trigger poll events
+			if (!m_poller_blocked) 
+			{
+				m_cache_empty = false;
+				p_evt->e = ipc_poll_event::event::POLLIN;
+				p_evt->pconn = this;
+				m_poller->queue_prewait_callback([this]() {
+					// prewait_callback will happen before next poller wait() cycle , 
+					// user of the connection is supposed to have done all reads
+					// and will suspending ifself until next byte arrives. 
+					// so that is the point we will trigger async 1byte cache read operation.
+
+					//a connection with poller blocked will not trigger asyc cache read
+					if (m_poller_blocked)
+						return;
+
+					//sometime user do their reads outside of poller's loop(thread context)
+					//in that case, by the time of next prewait callbacks, the cache may
+					//still be full, so we cannot trigger ASYNC read again for those connections automatically.
+					//in that case we consider it an error
+					if (!m_cache_empty) {
+						std::cerr << "no read is done inside poller's loop, make sure all read is done there!" << std::endl;
+						assert_line(0);
+					}
+
+					//trigger_async_cache_read is designed to not throw or fail, it will post error
+					//to completion IO port instead.
+					this->trigger_async_cache_read();
+				});
+			}
 		}
 		else if (error_code == ERROR_BROKEN_PIPE) {
 			p_evt->e = ipc_poll_event::event::POLLHUP;
 			p_evt->pconn = this;
 		}
-		else {
+		else if (error_code == ERROR_OPERATION_ABORTED) {
+			//CancelIoEx() will queue such packet when it successfully canceled an ASYNC IO request.
+			assert(transferred_cnt == 0);
+		}
+		else{
 			assert(0);
 		}
 	}
@@ -345,7 +367,40 @@ void ipc_connection_win_namedpipe::notify(int error_code, int transferred_cnt, u
 	}
 }
 
+ipc_connection_poll_blocker::ipc_connection_poll_blocker(ipc_connection * pc) :m_pc(pc) {	
+}
+ipc_connection_poll_blocker::~ipc_connection_poll_blocker() {
+	m_pc->unblock_poller();
+}
 
+EResult ipc_connection_win_namedpipe::block_poller()
+{
+	if (!m_poller_blocked) {
+
+		if (!CancelIoEx(native_handle(), &m_cache_overlapped))
+			return anERROR(-1, ::GetLastError()) << "CancelIoEx faield.";
+
+		DWORD NumberOfBytesTransferred = 0;
+		if (!GetOverlappedResult(native_handle(), &m_cache_overlapped, &NumberOfBytesTransferred, TRUE)) {
+			DWORD dwErr = GetLastError();
+			if(dwErr != ERROR_OPERATION_ABORTED)
+				return anERROR(-2, ::GetLastError()) << "GetOverlappedResult after CancelIoEx faield.";
+		}
+		assert(NumberOfBytesTransferred == 0);
+
+		m_poller_blocked = true;
+	}
+	return 0;
+}
+void ipc_connection_win_namedpipe::unblock_poller()
+{
+	if (m_poller_blocked) {
+		m_poller_blocked = false;
+
+		//continue
+		this->trigger_async_cache_read();
+	}
+}
 
 //blocking/sync version(based on async version)
 EResult ipc_connection_win_namedpipe::read(void * pvbuff, const int len, int *lp_cnt)
@@ -672,8 +727,8 @@ void ipc_connection_win_namedpipe::close(void)
 {
 	if (m_oshd != INVALID_OS_HANDLE) {
 		//close it
-		m_poller->del(this);
 		CloseHandle(m_oshd);
+		m_poller->del(this);
 		m_oshd = INVALID_OS_HANDLE;
 	}
 	m_state = state::EMPTY;
