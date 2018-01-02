@@ -476,12 +476,12 @@ EResult ipc_connection_win_namedpipe::read(void * pvbuff, const int len, int *lp
 	//fprintf(stderr, "<");
 	return 0;
 }
-EResult ipc_connection_win_namedpipe::write(void * pvbuff, const int len)
+EResult ipc_connection_win_namedpipe::write(const void * pvbuff, const int len)
 {
 	if (m_oshd == INVALID_OS_HANDLE || pvbuff == nullptr || len == 0)
 		return anERROR(-1) << "write() invalid argument m_oshd=" << m_oshd << " pvbuff=" << pvbuff << " len=" << len;
 	
-	unsigned char * pbuff = (unsigned char *)pvbuff;
+	const unsigned char * pbuff = (const unsigned char *)pvbuff;
 	int size = len;
 	int cnt = 0;
 	
@@ -738,7 +738,7 @@ void ipc_connection_win_namedpipe::close(void)
 
 #ifdef linux
 ipc_connection_linux_UDS::ipc_connection_linux_UDS(ipc_connection_poller * p) :
-	ipc_connection(p), m_fd(-1), m_name(""), m_state(state::EMPTY)
+	ipc_connection(p), m_fd(-1), m_name(""), m_state(state::EMPTY), m_poller_blocked(false)
 {}
 ipc_connection_linux_UDS::~ipc_connection_linux_UDS()
 {
@@ -797,12 +797,33 @@ void ipc_connection_linux_UDS::notify(int error_code, int transferred_cnt, uintp
 	}
 	else if (hint & EPOLLIN) {
 		//new data arrived
-		pevt->e = ipc_poll_event::event::POLLIN;
-		pevt->pconn = this;
+		if(!m_poller_blocked){
+			pevt->e = ipc_poll_event::event::POLLIN;
+			pevt->pconn = this;
+		}
 		//std::error_code ec(error_code, std::system_category());
 	}
 }
 
+ipc_connection_poll_blocker::ipc_connection_poll_blocker(ipc_connection * pc) :m_pc(pc) {
+}
+ipc_connection_poll_blocker::~ipc_connection_poll_blocker() {
+	m_pc->unblock_poller();
+}
+
+EResult ipc_connection_linux_UDS::block_poller()
+{
+	if (!m_poller_blocked) {
+		m_poller_blocked = true;
+	}
+	return 0;
+}
+void ipc_connection_linux_UDS::unblock_poller()
+{
+	if (m_poller_blocked) {
+		m_poller_blocked = false;
+	}
+}
 EResult ipc_connection_linux_UDS::connect(const std::string & serverName)
 {
 	if(m_state != state::EMPTY)
@@ -942,7 +963,7 @@ EResult ipc_connection_linux_UDS::read(void * buffer, const int bufferSize, int 
 	return 0;
 }
 
-EResult ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
+EResult ipc_connection_linux_UDS::write(const void * buffer, const int bufferSize)
 {
 
 	if (m_fd <= 0 || !buffer || bufferSize <= 0) {
@@ -952,7 +973,7 @@ EResult ipc_connection_linux_UDS::write(void * buffer, const int bufferSize)
 						  << " bufferSize=" << bufferSize;
 	}
 
-	char *ptr = static_cast<char*>(buffer);
+	const char *ptr = static_cast<const char*>(buffer);
 
 	int leftBytes = bufferSize;
 	while (leftBytes > 0) {

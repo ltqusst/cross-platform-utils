@@ -17,7 +17,7 @@ EResult daemonize(void)
 {
 #ifdef linux
 	int nochdir = 1;
-	int noclose = 1;
+	int noclose = 0;
 	if (daemon(nochdir, noclose) < 0)
 	{
 		return anERROR(-1, errno) << "daemon() failed";
@@ -95,7 +95,7 @@ EResult create_daemon(char* argv[])
 	if (access(path.c_str(), F_OK) < 0) 
 		return anERROR(-1) << "Error: Cannot find executable:" << path ;
 	
-	if (access(hddlService.c_str(), X_OK) < 0) 
+	if (access(path.c_str(), X_OK) < 0)
 		return anERROR(-1) << "Error: Target file has no execute permission:" << path;
 	
 	pid = fork();
@@ -107,13 +107,17 @@ EResult create_daemon(char* argv[])
 		//HInfo("Info: HDDL Service is forked, pid = %d.", pid);
 		//this wait will return as soon as child process is daemonized
 		waitpid(pid, &stat, 0);
-		return pid;
+		return 0;
 	}
 
 	// Child Process
 	//char* const argv[] = { const_cast<char* const>(hddlService.c_str()),
 	//	const_cast<char* const>(hddlInstallDir.c_str()),
 	//	const_cast<char* const>((char*)NULL) };
+
+	std::cout << "pid=" << pid << " now doing execv(" <<  argv[0] <<"," << std::endl;
+
+	daemonize();
 
 	if (execv(argv[0], argv))
 		return anERROR(-1,errno) << "Error: execv %s failed";

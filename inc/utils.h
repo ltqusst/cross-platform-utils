@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/epoll.h> /* epoll function */
 #include <sys/un.h>
 #endif
@@ -314,8 +315,7 @@ public:
 	}
 
 	//template specialization, add inner error
-	template<>
-	EResult& operator<<(const EResult& t)
+	EResult& operator<< (const EResult& t)
 	{
 		EResult_DEBUG("**** operator<<(EResult&) ");
 

@@ -63,10 +63,17 @@ add_subdirectory(test)
 #message("ipc_client is here   :" "$<TARGET_FILE:ipc_client>")
 #message("ipc_server is here   :" "$<TARGET_FILE:ipc_server>")
 
+set_target_properties( ipc_client ipc_server ${TARGET_LIB}
+    PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 enable_testing()
 
 add_test(NAME no_connection		COMMAND ipc_client "noconn")
-add_test(NAME start_server		COMMAND ipc_client "start" "ipc_server" "conn")
+add_test(NAME start_server		COMMAND ipc_client "start" "./bin/ipc_server" "conn")
 add_test(NAME test_conn			COMMAND ipc_client "conn")
 add_test(NAME test_tst1			COMMAND ipc_client "conn" "tst1" "tst1" "tst1" "tst1" "tst1" "tst1" "tst1" "tst1")
 add_test(NAME test_echos		COMMAND ipc_client "conn" "echo1" "1000" "echo2" "1000" "echo1" "1000" "echo2" "1000")

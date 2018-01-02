@@ -122,7 +122,7 @@ public:
 	//      2. dispatch the response task to another thread, and in that thread, 
 	//         sync version IO can be used without blocking io_service.
 	virtual EResult read(void * pbuff, const int len, int *lp_cnt = NULL) = 0;
-	virtual EResult write(void * pbuff, const int len) = 0;
+	virtual EResult write(const void * pbuff, const int len) = 0;
 
 	//can be used on duplicate fd(file descriptor) on Linux or File Handle on Windows
 	virtual void read(OS_HANDLE &oshd) = 0;
@@ -210,7 +210,7 @@ public:
 
 	//blocking/sync version(based on async version)
 	virtual EResult read(void * pbuff, const int len, int *lp_cnt = NULL);
-	virtual EResult write(void * pbuff, const int len);
+	virtual EResult write(const void * pbuff, const int len);
 
 	virtual void read(OS_HANDLE &oshd);
 	virtual void write(OS_HANDLE oshd);
@@ -226,9 +226,13 @@ public:
 protected:
 	bool set_block_mode(bool makeBlocking = true);
 
+	EResult block_poller();
+	void unblock_poller();
+
 	constexpr static const char * CLI_PATH = "/var/tmp/";
 	constexpr static const int  m_numListen = 5;
 
+	std::atomic<bool>		m_poller_blocked;
 	int 					m_fd;
 	const char *			m_name;		//IPC name
 
@@ -248,7 +252,7 @@ public:
 
 	//blocking/sync version(based on async version)
 	virtual EResult read(void * pbuff, const int len, int *lp_cnt = NULL);
-	virtual EResult write(void * pbuff, const int len);
+	virtual EResult write(const void * pbuff, const int len);
 
 	//can be used on duplicate fd(file descriptor) on Linux or File Handle on Windows
 	virtual void read(OS_HANDLE &oshd);

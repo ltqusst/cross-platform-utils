@@ -85,6 +85,7 @@ static cross::EResult client(int argc, char * argv[])
 				case ipc_poll_event::event::POLLHUP:
 				{
 					std::cout << "Server closed:" << evt.pconn->native_handle() << std::endl;
+					evt.pconn->close();
 					break;
 				}
 				break;
@@ -135,11 +136,12 @@ static cross::EResult client(int argc, char * argv[])
 			pis->getline(path, sizeof(path));
 			char * argv[] = { path, NULL };
 			err = create_daemon(argv);
+
 			if (err) break;
 
 			//give server some time to start
-			using namespace std::chrono_literals;
-			std::this_thread::sleep_for(2s);
+			//using namespace std::chrono_literals; //C++14
+			std::this_thread::sleep_for(std::chrono::seconds(2));
 		}
 		else
 		if (strcmp(buff_tx, "conn") == 0)
@@ -169,8 +171,8 @@ static cross::EResult client(int argc, char * argv[])
 		{
 			err = client->write(buff_tx, strlen(buff_tx));
 			//give server some time to stop
-			using namespace std::chrono_literals;
-			std::this_thread::sleep_for(1s);
+			//using namespace std::chrono_literals;
+			std::this_thread::sleep_for(std::chrono::seconds(1));
 		}
 		else
 		if (strcmp(buff_tx, "echo1") == 0 ||
